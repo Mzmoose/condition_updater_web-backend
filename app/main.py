@@ -1,7 +1,7 @@
 import logging, asyncio, os, json
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
@@ -12,7 +12,7 @@ from .oauth import (
     auto_refresh_if_needed,
     TokenStore,
 )
-from .utils import parse_skus_from_xlsx  # expects a list of dicts with at least {"sku": "...", "condition": "...", "conditionDescription": "..."}
+from .utils import parse_skus_from_xlsx
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -119,7 +119,7 @@ async def _put_inventory_item(sku: str, body: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=r.status_code, detail=data)
     return data
 
-# ---------- Inventory: ping ----------
+# ---------- Inventory: quick ping ----------
 @app.get("/inventory/ping")
 async def inventory_ping():
     headers = _auth_header()
@@ -133,7 +133,7 @@ async def inventory_ping():
         body = r.text[:1000]
     return {"status": r.status_code, "ok": r.status_code < 400, "data": body}
 
-# ---------- Inventory: update condition (single) ----------
+# ---------- Inventory: update condition (single JSON) ----------
 @app.post("/inventory/condition/update")
 async def inventory_condition_update(payload: Dict[str, Any] = Body(...)):
     sku = str(payload.get("sku", "")).strip()
@@ -141,24 +141,33 @@ async def inventory_condition_update(payload: Dict[str, Any] = Body(...)):
     condition_desc = str(payload.get("conditionDescription", "")).strip() or None
     if not sku:
         raise HTTPException(status_code=400, detail="Missing sku")
-
     current = await _get_inventory_item(sku)
-
-    # merge into current body
     body = current
     if condition is not None:
         body["condition"] = condition
     if condition_desc is not None:
         body["conditionDescription"] = condition_desc
-
     updated = await _put_inventory_item(sku, body)
     return {"status": "ok", "sku": sku, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": updated}
 
-# ---------- Inventory: batch update from XLSX ----------
+# ---------- Inventory: batch (form & handler) ----------
+@app.get("/inventory/condition/update-batch/form", response_class=HTMLResponse)
+def inventory_condition_update_batch_form():
+    return """
+    <html><body>
+      <h3>Upload XLSX for Condition Update</h3>
+      <form action="/inventory/condition/update-batch" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".xlsx" required />
+        <button type="submit">Upload & Run</button>
+      </form>
+      <p>Columns required: <code>sku</code>, <code>condition</code>, <code>conditionDescription</code></p>
+    </body></html>
+    """
+
 @app.post("/inventory/condition/update-batch")
 async def inventory_condition_update_batch(file: UploadFile = File(...)):
     content = await file.read()
-    rows = parse_skus_from_xlsx(content)  # expected keys: sku, condition, conditionDescription (case-insensitive ok if your parser normalizes)
+    rows = parse_skus_from_xlsx(content)  # expects keys: sku, condition, conditionDescription
     results: List[Dict[str, Any]] = []
     for row in rows:
         sku = str(row.get("sku", "")).strip()
