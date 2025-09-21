@@ -4,3 +4,4 @@ python-dotenv
 requests
 httpx
 cryptography
+openpyxl
