@@ -1,4 +1,4 @@
-import logging, asyncio, os, json, io
+import logging, asyncio, os, json, io, re
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
@@ -88,6 +88,47 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
+# ---------- XLSX parser (robust) ----------
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+def _parse_rows_from_ws(ws) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    headers = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        vals = [("" if v is None else str(v)) for v in row]
+        if i == 0:
+            headers = [_norm(h) for h in vals]
+            continue
+        if not any(v.strip() for v in vals):
+            continue
+        rec = {headers[j] if j < len(headers) else f"col{j}": vals[j].strip() if j < len(vals) else "" for j in range(max(len(headers), len(vals)))}
+        # map flexible header variants
+        sku = rec.get("sku") or rec.get("itemsku") or rec.get("customlabel") or rec.get("id")
+        cond = rec.get("condition") or rec.get("itemcondition") or rec.get("cond") or rec.get("conditionid")
+        conddesc = rec.get("conditiondescription") or rec.get("condition_desc") or rec.get("conditiontext") or rec.get("conddesc")
+        if sku and sku.strip():
+            rows.append({"sku": sku.strip(), "condition": (cond or "").strip(), "conditionDescription": (conddesc or "").strip()})
+    return rows
+
+def parse_skus_from_xlsx(binary: bytes) -> List[Dict[str, Any]]:
+    wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
+    rows: List[Dict[str, Any]] = []
+    # parse active sheet first; if empty, try all sheets
+    try:
+        rows = _parse_rows_from_ws(wb.active)
+    except Exception:
+        rows = []
+    if not rows:
+        for name in wb.sheetnames:
+            try:
+                rs = _parse_rows_from_ws(wb[name])
+                if rs:
+                    rows.extend(rs)
+            except Exception:
+                continue
+    return rows
+
 # ---------- Inventory helpers ----------
 EBAY_INV_BASE = "https://api.ebay.com/sell/inventory/v1"
 
@@ -118,30 +159,6 @@ async def _put_inventory_item(sku: str, body: Dict[str, Any]) -> Dict[str, Any]:
     if r.status_code >= 400:
         raise HTTPException(status_code=r.status_code, detail=data)
     return data
-
-# ---------- XLSX parser (inline) ----------
-def parse_skus_from_xlsx(binary: bytes) -> List[Dict[str, Any]]:
-    wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
-    ws = wb.active
-    headers = []
-    rows: List[Dict[str, Any]] = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        vals = [(c if c is not None else "") for c in row]
-        if i == 0:
-            headers = [str(h).strip().lower() for h in vals]
-            continue
-        if not any(str(v).strip() for v in vals):
-            continue
-        rec = {headers[j]: (str(vals[j]).strip() if j < len(vals) else "") for j in range(len(headers))}
-        # normalize keys
-        out = {
-            "sku": rec.get("sku", "") or rec.get("SKU", "") or rec.get("Sku", ""),
-            "condition": rec.get("condition", ""),
-            "conditionDescription": rec.get("conditiondescription", "") or rec.get("condition_description", ""),
-        }
-        if str(out["sku"]).strip():
-            rows.append(out)
-    return rows
 
 # ---------- Inventory: quick ping ----------
 @app.get("/inventory/ping")
@@ -174,17 +191,32 @@ async def inventory_condition_update(payload: Dict[str, Any] = Body(...)):
     updated = await _put_inventory_item(sku, body)
     return {"status": "ok", "sku": sku, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": updated}
 
-# ---------- Inventory: batch (form & handler) ----------
+# ---------- Inventory: batch (preview & run) ----------
+@app.post("/inventory/condition/preview")
+async def inventory_condition_preview(file: UploadFile = File(...)):
+    content = await file.read()
+    rows = parse_skus_from_xlsx(content)
+    # return the first 20 parsed rows to confirm headers
+    return {"parsed": len(rows), "sample": rows[:20]}
+
 @app.get("/inventory/condition/update-batch/form", response_class=HTMLResponse)
 def inventory_condition_update_batch_form():
     return """
     <html><body>
       <h3>Upload XLSX for Condition Update</h3>
+      <form action="/inventory/condition/preview" method="post" enctype="multipart/form-data" style="margin-bottom:12px;">
+        <input type="file" name="file" accept=".xlsx" required />
+        <button type="submit">Preview parsed rows</button>
+      </form>
       <form action="/inventory/condition/update-batch" method="post" enctype="multipart/form-data">
         <input type="file" name="file" accept=".xlsx" required />
         <button type="submit">Upload & Run</button>
       </form>
-      <p>Columns required: <code>sku</code>, <code>condition</code>, <code>conditionDescription</code></p>
+      <p>Accepted header variants:
+        <code>sku</code> (or <code>customlabel</code>/<code>itemsku</code>),
+        <code>condition</code>,
+        <code>conditionDescription</code> (or <code>condition_description</code>).
+      </p>
     </body></html>
     """
 
@@ -218,13 +250,3 @@ async def inventory_condition_update_batch(file: UploadFile = File(...)):
         logger.exception("Batch update failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Batch update failed: {e}")
 
-# ---------- Debug ----------
-@app.get("/debug/token-file")
-def debug_token_file():
-    path = os.getenv("TOKEN_PATH", "/data/tokens.json")
-    exists = os.path.exists(path)
-    size = os.path.getsize(path) if exists else None
-    if exists and not TokenStore.get():
-        with open(path) as f:
-            TokenStore.save(json.load(f))
-    return {"path": path, "exists": exists, "size": size}
