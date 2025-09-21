@@ -1,7 +1,13 @@
-.git
-.env
 __pycache__/
 *.pyc
 *.pyo
-*.DS_Store
+*.pyd
+.env
 .venv
+venv/
+build/
+dist/
+.git
+.gitignore
+Dockerfile
+README.md
