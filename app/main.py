@@ -1,5 +1,6 @@
 import logging, asyncio, os, json
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+from typing import List, Dict, Any
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -11,7 +12,7 @@ from .oauth import (
     auto_refresh_if_needed,
     TokenStore,
 )
-from .utils import parse_skus_from_xlsx
+from .utils import parse_skus_from_xlsx  # expects a list of dicts with at least {"sku": "...", "condition": "...", "conditionDescription": "..."}
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -87,18 +88,42 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
-# ---------- Inventory scope test ----------
-@app.get("/inventory/ping")
-async def inventory_ping():
+# ---------- Inventory helpers ----------
+EBAY_INV_BASE = "https://api.ebay.com/sell/inventory/v1"
+
+def _auth_header() -> Dict[str, str]:
     tok = TokenStore.get() or {}
     access = tok.get("access_token")
     if not access:
         raise HTTPException(status_code=400, detail="No access_token; run /oauth/login")
-    url = "https://api.ebay.com/sell/inventory/v1/inventory_item"
-    headers = {
-        "Authorization": f"Bearer {access}",
-        "Accept": "application/json",
-    }
+    return {"Authorization": f"Bearer {access}", "Accept": "application/json", "Content-Type": "application/json"}
+
+async def _get_inventory_item(sku: str) -> Dict[str, Any]:
+    url = f"{EBAY_INV_BASE}/inventory_item/{sku}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=_auth_header())
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"SKU {sku} not found")
+    r.raise_for_status()
+    return r.json()
+
+async def _put_inventory_item(sku: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{EBAY_INV_BASE}/inventory_item/{sku}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.put(url, headers=_auth_header(), content=json.dumps(body))
+    try:
+        data = r.json()
+    except Exception:
+        data = {"text": r.text[:1000]}
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=data)
+    return data
+
+# ---------- Inventory: ping ----------
+@app.get("/inventory/ping")
+async def inventory_ping():
+    headers = _auth_header()
+    url = f"{EBAY_INV_BASE}/inventory_item"
     params = {"limit": "1"}
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, headers=headers, params=params)
@@ -108,14 +133,55 @@ async def inventory_ping():
         body = r.text[:1000]
     return {"status": r.status_code, "ok": r.status_code < 400, "data": body}
 
-# ---------- Business endpoint ----------
-@app.post("/condition/update")
-async def condition_update(file: UploadFile = File(...)):
-    content = await file.read()
-    skus = parse_skus_from_xlsx(content)
-    return {"received_skus": len(skus)}
+# ---------- Inventory: update condition (single) ----------
+@app.post("/inventory/condition/update")
+async def inventory_condition_update(payload: Dict[str, Any] = Body(...)):
+    sku = str(payload.get("sku", "")).strip()
+    condition = str(payload.get("condition", "")).strip() or None
+    condition_desc = str(payload.get("conditionDescription", "")).strip() or None
+    if not sku:
+        raise HTTPException(status_code=400, detail="Missing sku")
 
-# ---------- Debug (disk token file) ----------
+    current = await _get_inventory_item(sku)
+
+    # merge into current body
+    body = current
+    if condition is not None:
+        body["condition"] = condition
+    if condition_desc is not None:
+        body["conditionDescription"] = condition_desc
+
+    updated = await _put_inventory_item(sku, body)
+    return {"status": "ok", "sku": sku, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": updated}
+
+# ---------- Inventory: batch update from XLSX ----------
+@app.post("/inventory/condition/update-batch")
+async def inventory_condition_update_batch(file: UploadFile = File(...)):
+    content = await file.read()
+    rows = parse_skus_from_xlsx(content)  # expected keys: sku, condition, conditionDescription (case-insensitive ok if your parser normalizes)
+    results: List[Dict[str, Any]] = []
+    for row in rows:
+        sku = str(row.get("sku", "")).strip()
+        if not sku:
+            results.append({"sku": None, "ok": False, "error": "missing sku"})
+            continue
+        try:
+            cur = await _get_inventory_item(sku)
+            body = cur
+            if "condition" in row and str(row["condition"]).strip():
+                body["condition"] = str(row["condition"]).strip()
+            if "conditionDescription" in row and str(row["conditionDescription"]).strip():
+                body["conditionDescription"] = str(row["conditionDescription"]).strip()
+            put = await _put_inventory_item(sku, body)
+            results.append({"sku": sku, "ok": True, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": put})
+        except HTTPException as e:
+            results.append({"sku": sku, "ok": False, "status": e.status_code, "error": e.detail})
+        except Exception as e:
+            results.append({"sku": sku, "ok": False, "error": str(e)})
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return {"updated": ok_count, "total": len(results), "results": results}
+
+# ---------- Debug ----------
 @app.get("/debug/token-file")
 def debug_token_file():
     path = os.getenv("TOKEN_PATH", "/data/tokens.json")
