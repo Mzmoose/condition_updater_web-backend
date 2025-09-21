@@ -1,9 +1,10 @@
-import logging, asyncio, os, json
+import logging, asyncio, os, json, io
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+from openpyxl import load_workbook
 
 from .oauth import (
     build_auth_url,
@@ -12,7 +13,6 @@ from .oauth import (
     auto_refresh_if_needed,
     TokenStore,
 )
-from .utils import parse_skus_from_xlsx
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -119,6 +119,30 @@ async def _put_inventory_item(sku: str, body: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=r.status_code, detail=data)
     return data
 
+# ---------- XLSX parser (inline) ----------
+def parse_skus_from_xlsx(binary: bytes) -> List[Dict[str, Any]]:
+    wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
+    ws = wb.active
+    headers = []
+    rows: List[Dict[str, Any]] = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        vals = [(c if c is not None else "") for c in row]
+        if i == 0:
+            headers = [str(h).strip().lower() for h in vals]
+            continue
+        if not any(str(v).strip() for v in vals):
+            continue
+        rec = {headers[j]: (str(vals[j]).strip() if j < len(vals) else "") for j in range(len(headers))}
+        # normalize keys
+        out = {
+            "sku": rec.get("sku", "") or rec.get("SKU", "") or rec.get("Sku", ""),
+            "condition": rec.get("condition", ""),
+            "conditionDescription": rec.get("conditiondescription", "") or rec.get("condition_description", ""),
+        }
+        if str(out["sku"]).strip():
+            rows.append(out)
+    return rows
+
 # ---------- Inventory: quick ping ----------
 @app.get("/inventory/ping")
 async def inventory_ping():
@@ -166,29 +190,33 @@ def inventory_condition_update_batch_form():
 
 @app.post("/inventory/condition/update-batch")
 async def inventory_condition_update_batch(file: UploadFile = File(...)):
-    content = await file.read()
-    rows = parse_skus_from_xlsx(content)  # expects keys: sku, condition, conditionDescription
-    results: List[Dict[str, Any]] = []
-    for row in rows:
-        sku = str(row.get("sku", "")).strip()
-        if not sku:
-            results.append({"sku": None, "ok": False, "error": "missing sku"})
-            continue
-        try:
-            cur = await _get_inventory_item(sku)
-            body = cur
-            if "condition" in row and str(row["condition"]).strip():
-                body["condition"] = str(row["condition"]).strip()
-            if "conditionDescription" in row and str(row["conditionDescription"]).strip():
-                body["conditionDescription"] = str(row["conditionDescription"]).strip()
-            put = await _put_inventory_item(sku, body)
-            results.append({"sku": sku, "ok": True, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": put})
-        except HTTPException as e:
-            results.append({"sku": sku, "ok": False, "status": e.status_code, "error": e.detail})
-        except Exception as e:
-            results.append({"sku": sku, "ok": False, "error": str(e)})
-    ok_count = sum(1 for r in results if r.get("ok"))
-    return {"updated": ok_count, "total": len(results), "results": results}
+    try:
+        content = await file.read()
+        rows = parse_skus_from_xlsx(content)
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            sku = str(row.get("sku", "")).strip()
+            if not sku:
+                results.append({"sku": None, "ok": False, "error": "missing sku"})
+                continue
+            try:
+                cur = await _get_inventory_item(sku)
+                body = cur
+                if "condition" in row and str(row["condition"]).strip():
+                    body["condition"] = str(row["condition"]).strip()
+                if "conditionDescription" in row and str(row["conditionDescription"]).strip():
+                    body["conditionDescription"] = str(row["conditionDescription"]).strip()
+                put = await _put_inventory_item(sku, body)
+                results.append({"sku": sku, "ok": True, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": put})
+            except HTTPException as e:
+                results.append({"sku": sku, "ok": False, "status": e.status_code, "error": e.detail})
+            except Exception as e:
+                results.append({"sku": sku, "ok": False, "error": str(e)})
+        ok_count = sum(1 for r in results if r.get("ok"))
+        return {"updated": ok_count, "total": len(results), "results": results}
+    except Exception as e:
+        logger.exception("Batch update failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Batch update failed: {e}")
 
 # ---------- Debug ----------
 @app.get("/debug/token-file")
