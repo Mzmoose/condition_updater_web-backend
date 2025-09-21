@@ -1,9 +1,15 @@
-import logging, asyncio
+import logging, asyncio, os, json
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .oauth import build_auth_url, exchange_code_for_tokens, refresh_tokens, auto_refresh_if_needed, TokenStore
+from .oauth import (
+    build_auth_url,
+    exchange_code_for_tokens,
+    refresh_tokens,
+    auto_refresh_if_needed,
+    TokenStore,
+)
 from .utils import parse_skus_from_xlsx
 
 logger = logging.getLogger("uvicorn.error")
@@ -79,3 +85,15 @@ async def condition_update(file: UploadFile = File(...)):
     content = await file.read()
     skus = parse_skus_from_xlsx(content)
     return {"received_skus": len(skus)}
+
+# ---- debug helper to inspect the token file on disk ----
+@app.get("/debug/token-file")
+def debug_token_file():
+    path = os.getenv("TOKEN_PATH", "/data/tokens.json")
+    exists = os.path.exists(path)
+    size = os.path.getsize(path) if exists else None
+    # auto-load tokens from disk if memory is empty
+    if exists and not TokenStore.get():
+        with open(path) as f:
+            TokenStore.save(json.load(f))
+    return {"path": path, "exists": exists, "size": size}
