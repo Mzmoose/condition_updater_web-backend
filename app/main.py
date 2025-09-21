@@ -1,9 +1,9 @@
-import logging
+import logging, asyncio
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .oauth import build_auth_url, exchange_code_for_tokens, refresh_tokens, TokenStore
+from .oauth import build_auth_url, exchange_code_for_tokens, refresh_tokens, auto_refresh_if_needed, TokenStore
 from .utils import parse_skus_from_xlsx
 
 logger = logging.getLogger("uvicorn.error")
@@ -17,6 +17,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def _start_refresher():
+    async def loop():
+        while True:
+            try:
+                refreshed = await auto_refresh_if_needed()
+                if refreshed:
+                    logger.info("Access token auto-refreshed")
+            except Exception as e:
+                logger.exception("Auto-refresh failed: %s", e)
+            await asyncio.sleep(300)
+    asyncio.create_task(loop())
 
 @app.get("/")
 def root():
