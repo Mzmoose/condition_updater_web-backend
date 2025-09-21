@@ -15,4 +15,5 @@ COPY . /app
 
 EXPOSE 10000
 
-CMD ["/bin/sh","-lc","exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+
