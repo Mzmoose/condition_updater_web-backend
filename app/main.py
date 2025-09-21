@@ -51,6 +51,11 @@ def oauth_login():
     logger.info("Redirecting to eBay auth: %s", url)
     return RedirectResponse(url)
 
+@app.get("/oauth/login/url")
+def oauth_login_url():
+    url = build_auth_url()
+    return {"url": url}
+
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
     q = dict(request.query_params)
