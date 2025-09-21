@@ -3,7 +3,7 @@ from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .oauth import build_auth_url, exchange_code_for_tokens, TokenStore
+from .oauth import build_auth_url, exchange_code_for_tokens, refresh_tokens, TokenStore
 from .utils import parse_skus_from_xlsx
 
 logger = logging.getLogger("uvicorn.error")
@@ -18,16 +18,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/")
 def root():
     return RedirectResponse("/docs")
 
-
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
-
 
 @app.get("/oauth/login")
 def oauth_login():
@@ -35,22 +32,16 @@ def oauth_login():
     logger.info("Redirecting to eBay auth: %s", url)
     return RedirectResponse(url)
 
-
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
     q = dict(request.query_params)
     if "error" in q:
-        return JSONResponse(
-            {"status": "error", "error": q.get("error"), "error_description": q.get("error_description")}
-        )
+        return JSONResponse({"status": "error", "error": q.get("error"), "error_description": q.get("error_description")})
     code = q.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' in callback")
-
     token_data = await exchange_code_for_tokens(code)
-    TokenStore.save(token_data)
     return {"status": "ok", "message": "Tokens stored"}
-
 
 @app.get("/oauth/token/status")
 def token_status():
@@ -59,9 +50,16 @@ def token_status():
         "has_token": bool(data),
         "token_type": data.get("token_type"),
         "expires_in": data.get("expires_in"),
+        "access_expires_at": data.get("access_expires_at"),
+        "refresh_token": bool(data.get("refresh_token")),
+        "refresh_expires_at": data.get("refresh_expires_at"),
         "scope": data.get("scope"),
     }
 
+@app.post("/oauth/refresh")
+async def oauth_refresh():
+    tokens = await refresh_tokens()
+    return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
 @app.post("/condition/update")
 async def condition_update(file: UploadFile = File(...)):
