@@ -2,6 +2,7 @@ import logging, asyncio, os, json
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
 from .oauth import (
     build_auth_url,
@@ -45,6 +46,7 @@ def root():
 def healthz():
     return {"ok": True}
 
+# ---------- OAuth ----------
 @app.get("/oauth/login")
 def oauth_login():
     url = build_auth_url()
@@ -85,19 +87,40 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
+# ---------- Inventory scope test ----------
+@app.get("/inventory/ping")
+async def inventory_ping():
+    tok = TokenStore.get() or {}
+    access = tok.get("access_token")
+    if not access:
+        raise HTTPException(status_code=400, detail="No access_token; run /oauth/login")
+    url = "https://api.ebay.com/sell/inventory/v1/inventory_item"
+    headers = {
+        "Authorization": f"Bearer {access}",
+        "Accept": "application/json",
+    }
+    params = {"limit": "1"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers, params=params)
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:1000]
+    return {"status": r.status_code, "ok": r.status_code < 400, "data": body}
+
+# ---------- Business endpoint ----------
 @app.post("/condition/update")
 async def condition_update(file: UploadFile = File(...)):
     content = await file.read()
     skus = parse_skus_from_xlsx(content)
     return {"received_skus": len(skus)}
 
-# ---- debug helper to inspect the token file on disk ----
+# ---------- Debug (disk token file) ----------
 @app.get("/debug/token-file")
 def debug_token_file():
     path = os.getenv("TOKEN_PATH", "/data/tokens.json")
     exists = os.path.exists(path)
     size = os.path.getsize(path) if exists else None
-    # auto-load tokens from disk if memory is empty
     if exists and not TokenStore.get():
         with open(path) as f:
             TokenStore.save(json.load(f))
