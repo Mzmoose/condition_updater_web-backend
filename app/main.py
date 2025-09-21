@@ -18,13 +18,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @app.get("/")
 def root():
     return RedirectResponse("/docs")
 
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
 
 @app.get("/oauth/login")
 def oauth_login():
@@ -32,27 +35,36 @@ def oauth_login():
     logger.info("Redirecting to eBay auth: %s", url)
     return RedirectResponse(url)
 
+
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
     q = dict(request.query_params)
     if "error" in q:
         return JSONResponse(
-            {"status": "error", "error": q.get("error"), "error_description": q.get("error_description")},
-            status_code=400,
+            {"status": "error", "error": q.get("error"), "error_description": q.get("error_description")}
         )
     code = q.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' in callback")
+
     token_data = await exchange_code_for_tokens(code)
     TokenStore.save(token_data)
     return {"status": "ok", "message": "Tokens stored"}
+
+
+@app.get("/oauth/token/status")
+def token_status():
+    data = TokenStore.get() or {}
+    return {
+        "has_token": bool(data),
+        "token_type": data.get("token_type"),
+        "expires_in": data.get("expires_in"),
+        "scope": data.get("scope"),
+    }
+
 
 @app.post("/condition/update")
 async def condition_update(file: UploadFile = File(...)):
     content = await file.read()
     skus = parse_skus_from_xlsx(content)
     return {"received_skus": len(skus)}
-
-@app.get("/oauth/login/url")
-def oauth_login_url():
-    return {"url": build_auth_url()}
