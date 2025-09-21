@@ -49,3 +49,7 @@ async def condition_update(file: UploadFile = File(...)):
     content = await file.read()
     skus = parse_skus_from_xlsx(content)
     return {"received_skus": len(skus)}
+    @app.get("/oauth/login/url")
+def oauth_login_url():
+    return {"url": build_auth_url()}
+
