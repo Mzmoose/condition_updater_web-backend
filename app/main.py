@@ -36,7 +36,10 @@ def oauth_login():
 async def oauth_callback(request: Request):
     q = dict(request.query_params)
     if "error" in q:
-        return JSONResponse({"status": "error", "error": q.get("error"), "error_description": q.get("error_description")}, status_code=400)
+        return JSONResponse(
+            {"status": "error", "error": q.get("error"), "error_description": q.get("error_description")},
+            status_code=400,
+        )
     code = q.get("code")
     if not code:
         raise HTTPException(status_code=400, detail="Missing 'code' in callback")
@@ -49,7 +52,7 @@ async def condition_update(file: UploadFile = File(...)):
     content = await file.read()
     skus = parse_skus_from_xlsx(content)
     return {"received_skus": len(skus)}
-    @app.get("/oauth/login/url")
+
+@app.get("/oauth/login/url")
 def oauth_login_url():
     return {"url": build_auth_url()}
-
