@@ -1,12 +1,7 @@
-import logging, asyncio, os, io, re, csv, json, html
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File
+import logging, asyncio
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
-from openpyxl import load_workbook
-import xml.etree.ElementTree as ET
 
 from .oauth import (
     build_auth_url,
@@ -16,10 +11,12 @@ from .oauth import (
     TokenStore,
 )
 
+from .tools.condition_updater import router as condition_router
+from .tools.bulk_downloader import router as bulk_router
+
 logger = logging.getLogger("uvicorn.error")
 
-# ────────────────────────────── App ──────────────────────────────
-app = FastAPI(title="Condition Updater (Scheduled, Trading API)")
+app = FastAPI(title="Seller Tools Hub")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,13 +40,24 @@ async def _start_refresher():
 
 @app.get("/")
 def root():
-    return RedirectResponse("/docs")
+    return RedirectResponse("/tools")
+
+@app.get("/tools", response_class=HTMLResponse)
+def tools_home():
+    return """
+    <html><body>
+      <h2>Tool Hub</h2>
+      <ul>
+        <li><a href="/trading/condition/update-batch/form">Condition Updater (Scheduled)</a></li>
+        <li><a href="/bulk-download/form">Bulk Downloader</a></li>
+      </ul>
+    </body></html>
+    """
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
 
-# ─────────────────────── OAuth (unchanged) ───────────────────────
 @app.get("/oauth/login")
 def oauth_login():
     return RedirectResponse(build_auth_url())
@@ -87,401 +95,11 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
-# ─────────────────────── Helpers: first 4 digits ───────────────────────
-FIRST4_RE = re.compile(r"^\s*(\d{4})")
-
-def first4(s: str) -> str:
-    """Return the first 4 leading digits from a string; empty if not found."""
-    if not s:
-        return ""
-    m = FIRST4_RE.match(s)
-    return m.group(1) if m else ""
-
-# ─────────────────────── File → SKUs helper ──────────────────────
-def parse_file_to_skus(binary: bytes, filename: str) -> List[str]:
-    """Accept .xlsx/.csv/.txt and return only the first 4 digits from each row/line."""
-    def push(acc: List[str], raw: str):
-        key = first4(raw)
-        if key:
-            acc.append(key)
-
-    name = (filename or "").lower()
-    if name.endswith(".xlsx"):
-        wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
-        skus: List[str] = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                if not row:
-                    continue
-                v = row[0]
-                if v is None:
-                    continue
-                push(skus, str(v))
-        # de-dup preserve order
-        seen, out = set(), []
-        for s in skus:
-            if s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out
-
-    if name.endswith(".csv"):
-        text = binary.decode("utf-8", errors="replace")
-        rdr = csv.reader(io.StringIO(text))
-        skus: List[str] = []
-        for i, row in enumerate(rdr):
-            if not row:
-                continue
-            raw = str(row[0])
-            if i == 0 and raw.strip().lower() in {"sku", "customlabel"} and len(row) == 1:
-                continue
-            push(skus, raw)
-        return skus
-
-    # .txt: one per line
-    text = binary.decode("utf-8", errors="replace")
-    skus: List[str] = []
-    for ln in text.splitlines():
-        push(skus, ln)
-    return [s for s in skus if s]
-
-# ───────────────────── Trading API client (OAuth) ─────────────────────
-TRADING_ENDPOINT = "https://api.ebay.com/ws/api.dll"
-SITE_ID = os.getenv("EBAY_SITE_ID", "0")             # 0 = US
-COMPAT_LEVEL = os.getenv("EBAY_COMPAT_LEVEL", "1231")
-
-def _oauth_token() -> str:
-    data = TokenStore.get() or {}
-    tok = data.get("access_token")
-    if not tok:
-        raise HTTPException(status_code=400, detail="No access_token; run /oauth/login")
-    return tok
-
-def _headers(call_name: str) -> Dict[str, str]:
-    return {
-        "X-EBAY-API-CALL-NAME": call_name,
-        "X-EBAY-API-SITEID": SITE_ID,
-        "X-EBAY-API-COMPATIBILITY-LEVEL": COMPAT_LEVEL,
-        "X-EBAY-API-IAF-TOKEN": _oauth_token(),
-        "Content-Type": "text/xml",
-        "Accept": "text/xml",
-    }
-
-def _wrap(call: str, inner_xml: str) -> str:
-    return f'<?xml version="1.0" encoding="utf-8"?><{call}Request xmlns="urn:ebay:apis:eBLBaseComponents">{inner_xml}</{call}Request>'
-
-async def trading_call(call_name: str, body_xml: str) -> ET.Element:
-    xml = _wrap(call_name, body_xml)
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(TRADING_ENDPOINT, headers=_headers(call_name), content=xml)
-    try:
-        root = ET.fromstring(r.text)
-    except Exception:
-        logger.error("Trading parse error (%s): %s", call_name, r.text[:1000])
-        raise HTTPException(status_code=502, detail=f"Trading parse error: {call_name}")
-    ack = (root.findtext(".//{urn:ebay:apis:eBLBaseComponents}Ack") or "").upper()
-    if ack not in {"SUCCESS", "WARNING"}:
-        short = root.findtext(".//{urn:ebay:apis:eBLBaseComponents}ShortMessage") or "Error"
-        long = root.findtext(".//{urn:ebay:apis:eBLBaseComponents}LongMessage") or ""
-        raise HTTPException(status_code=400, detail=f"{call_name}: {short} {long}".strip())
-    return root
-
-# ───────────── Utilities ─────────────
-def _ebay_time(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-
-# Convert HTML to text while preserving logical breaks so labels like "Brand:" don't glue on.
-def _html_to_text_preserve_breaks(desc_html: str) -> str:
-    if not desc_html:
-        return ""
-    t = desc_html
-    # turn common block/line tags into newlines before stripping
-    t = re.sub(r"(?is)<\s*br\s*/?\s*>", "\n", t)
-    t = re.sub(r"(?is)</\s*p\s*>", "\n", t)
-    t = re.sub(r"(?is)</\s*div\s*>", "\n", t)
-    t = re.sub(r"(?is)</\s*li\s*>", "\n", t)
-    t = re.sub(r"(?is)<\s*p[^>]*>", "\n", t)
-    t = re.sub(r"(?is)<\s*div[^>]*>", "\n", t)
-    t = re.sub(r"(?is)<\s*li[^>]*>", "\n- ", t)
-    # strip remaining tags
-    t = re.sub(r"(?is)<[^>]+>", "", t)
-    t = html.unescape(t)
-    # normalize whitespace/newlines
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    t = re.sub(r"[ \t]{2,}", " ", t)
-    return t.strip()
-
-# ───────────── Scheduled lookup (GetSellerList w/ ReturnAll + pagination) ─────────────
-async def _get_scheduled_via_getsellerlist() -> List[Dict[str, str]]:
-    now = datetime.now(timezone.utc)
-    to  = now + timedelta(days=120)
-    page = 1
-    items: List[Dict[str, str]] = []
-
-    while True:
-        body = f"""
-            <RequesterCredentials/>
-            <StartTimeFrom>{_ebay_time(now)}</StartTimeFrom>
-            <StartTimeTo>{_ebay_time(to)}</StartTimeTo>
-            <DetailLevel>ReturnAll</DetailLevel>
-            <Pagination>
-                <EntriesPerPage>200</EntriesPerPage>
-                <PageNumber>{page}</PageNumber>
-            </Pagination>
-        """
-        root = await trading_call("GetSellerList", body)
-        ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
-
-        for it in root.findall(".//e:ItemArray/e:Item", ns):
-            status = (it.findtext("e:ListingStatus", default="", namespaces=ns) or "").lower()
-            if status != "scheduled":
-                continue
-            items.append({
-                "itemId": it.findtext("e:ItemID", default="", namespaces=ns) or "",
-                "title": it.findtext("e:Title", default="", namespaces=ns) or "",
-                "sku": it.findtext("e:SKU", default="", namespaces=ns) or "",
-                "customLabel": it.findtext("e:SellingManagerProductDetails/e:CustomLabel", default="", namespaces=ns) or "",
-            })
-
-        has_more = (root.findtext(".//e:HasMoreItems", default="false", namespaces=ns) or "").lower() == "true"
-        page += 1
-        if not has_more or page > 50:
-            break
-
-    return items
-
-# ───────────── Fallback: GetMyeBaySelling ScheduledList (ReturnAll) ─────────────
-async def _get_scheduled_via_getmyebayselling() -> List[Dict[str, str]]:
-    items: List[Dict[str, str]] = []
-    page = 1
-    while True:
-        body = f"""
-            <RequesterCredentials/>
-            <DetailLevel>ReturnAll</DetailLevel>
-            <ScheduledList>
-                <Include>true</Include>
-                <Pagination>
-                    <EntriesPerPage>200</EntriesPerPage>
-                    <PageNumber>{page}</PageNumber>
-                </Pagination>
-            </ScheduledList>
-            <ActiveList><Include>false</Include></ActiveList>
-            <UnsoldList><Include>false</Include></UnsoldList>
-        """
-        root = await trading_call("GetMyeBaySelling", body)
-        ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
-
-        arr = root.findall(".//e:ScheduledList/e:ItemArray/e:Item", ns)
-        if not arr:
-            break
-        for it in arr:
-            items.append({
-                "itemId": it.findtext("e:ItemID", default="", namespaces=ns) or "",
-                "title": it.findtext("e:Title", default="", namespaces=ns) or "",
-                "sku": it.findtext("e:SKU", default="", namespaces=ns) or "",
-                "customLabel": it.findtext("e:SellingManagerProductDetails/e:CustomLabel", default="", namespaces=ns) or "",
-            })
-
-        total_pages = int(
-            root.findtext(".//e:ScheduledList/e:PaginationResult/e:TotalNumberOfPages",
-                          default="1", namespaces=ns) or "1"
-        )
-        page += 1
-        if page > total_pages or page > 50:
-            break
-
-    return items
-
-# ───────────── Build index from both sources (with first4 keys) ─────────────
-async def get_scheduled_index() -> Dict[str, Dict[str, str]]:
-    primary = await _get_scheduled_via_getsellerlist()
-    fallback = await _get_scheduled_via_getmyebayselling()
-    all_items = primary + fallback
-
-    index: Dict[str, Dict[str, str]] = {}
-    for it in all_items:
-        for key in (it.get("sku",""), it.get("customLabel","")):
-            if not key or not key.strip():
-                continue
-            full = key.strip().lower()
-            f4 = first4(key)
-            payload = {
-                "itemId": it.get("itemId",""),
-                "title": it.get("title",""),
-                "sku": it.get("sku",""),
-                "customLabel": it.get("customLabel",""),
-            }
-            index[full] = payload
-            if f4 and f4 not in index:
-                index[f4] = payload
-    return index
-
-# ───────────── Get/Revise Item ─────────────
-async def get_item_description(item_id: str) -> str:
-    body = f"""
-        <RequesterCredentials/>
-        <ItemID>{item_id}</ItemID>
-        <DetailLevel>ReturnAll</DetailLevel>
-    """
-    root = await trading_call("GetItem", body)
-    ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
-    return root.findtext(".//e:Item/e:Description", default="", namespaces=ns) or ""
-
-# --- NEW: robust extractor that stops at newline or next Word: label, else first sentence ---
-LABEL_AFTER_RE = re.compile(r"\b[A-Z][A-Za-z]+:", re.MULTILINE)
-COND_LABEL_RE = re.compile(r"(?i)condition\s*:\s*")
-
-def extract_condition_sentence_after_label(description_html: str, max_len: int = 600) -> str:
-    if not description_html:
-        return ""
-    text = _html_to_text_preserve_breaks(description_html)
-
-    m = COND_LABEL_RE.search(text)
-    if not m:
-        return ""
-
-    after = text[m.end():].lstrip()
-
-    # 1) Prefer stopping at first newline (the "condition" line)
-    nl = after.find("\n")
-    candidates = []
-    if nl >= 0:
-        candidates.append(nl)
-
-    # 2) Or at the next "Word:" label like Brand:, Item:, Color:
-    lm = LABEL_AFTER_RE.search(after)
-    if lm:
-        candidates.append(lm.start())
-
-    # 3) Or at the end of the first sentence (., !, ?)
-    pm = re.search(r"[\.!\?]", after)
-    if pm:
-        candidates.append(pm.end())
-
-    end = min([c for c in candidates if c > 0], default=len(after))
-    snippet = after[:end].strip(" \t-•–—")
-
-    # normalize internal whitespace
-    snippet = re.sub(r"[ \t]{2,}", " ", snippet)
-
-    # ensure trailing period
-    if snippet and snippet[-1] not in ".!?":
-        snippet += "."
-
-    # length clamp
-    if len(snippet) > max_len:
-        snippet = snippet[: max_len].rstrip()
-        if snippet and snippet[-1] not in ".!?":
-            snippet += "."
-
-    return snippet
-
-async def revise_condition_description(item_id: str, cond_desc: str) -> None:
-    body = f"""
-        <RequesterCredentials/>
-        <Item>
-            <ItemID>{item_id}</ItemID>
-            <ConditionDescription>{html.escape(cond_desc)}</ConditionDescription>
-        </Item>
-    """
-    await trading_call("ReviseItem", body)
-
-async def verify_condition(item_id: str, expected: str) -> bool:
-    body = f"""
-        <RequesterCredentials/>
-        <ItemID>{item_id}</ItemID>
-        <DetailLevel>ReturnAll</DetailLevel>
-    """
-    root = await trading_call("GetItem", body)
-    ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
-    actual = root.findtext(".//e:Item/e:ConditionDescription", default="", namespaces=ns) or ""
-    return actual.strip() == expected.strip()
-
-# ───────────── UI Forms ─────────────
-@app.get("/trading/condition/update-batch/form", response_class=HTMLResponse)
-def form():
-    return """
-    <html><body>
-      <h3>Scheduled Listings — Condition Updater</h3>
-      <p>Upload SKUs only (.xlsx, .csv, or .txt). One SKU per row/line. Only the first 4 digits on each row are used.</p>
-      <form action="/trading/condition/preview" method="post" enctype="multipart/form-data" style="margin-bottom:12px;">
-        <input type="file" name="file" accept=".xlsx,.csv,.txt" required />
-        <button type="submit">Preview (match SKUs to Scheduled)</button>
-      </form>
-      <form action="/trading/condition/update-batch" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".xlsx,.csv,.txt" required />
-        <button type="submit">Run Update</button>
-      </form>
-      <p><i>Logic: find 'Condition:' in Description, take only the first line (or next label), ensure it ends with a period.</i></p>
-      <p>Debug: <a href="/trading/scheduled/sample">/trading/scheduled/sample</a></p>
-    </body></html>
-    """
-
-# ───────────── Debug: peek at what eBay returns ─────────────
-@app.get("/trading/scheduled/sample")
-async def scheduled_sample():
-    idx = await get_scheduled_index()
-    sample = []
-    for i, (k, v) in enumerate(idx.items()):
-        if i >= 50: break
-        sample.append({"key": k, **v})
-    return {"count": len(idx), "sample": sample}
-
-# ───────────── Preview: which SKUs match Scheduled ─────────────
-@app.post("/trading/condition/preview")
-async def preview(file: UploadFile = File(...)):
-    content = await file.read()
-    skus = parse_file_to_skus(content, file.filename)
-    index = await get_scheduled_index()
-    items = []
-    for s in skus:
-        m = index.get(s.strip().lower())
-        items.append({"sku": s, "matched": bool(m), "itemId": (m or {}).get("itemId"), "title": (m or {}).get("title")})
-    return {"input_count": len(skus), "matched": sum(1 for x in items if x["matched"]), "items": items[:200]}
-
-# ───────────── Batch Update ─────────────
-@app.post("/trading/condition/update-batch")
-async def update_batch(file: UploadFile = File(...)):
-    content = await file.read()
-    skus = parse_file_to_skus(content, file.filename)
-    index = await get_scheduled_index()
-
-    results: List[Dict[str, Any]] = []
-    for s in skus:
-        key = s.strip().lower()
-        info = index.get(key)
-        if not info:
-            results.append({"sku": s, "ok": False, "error": "SKU not found in Scheduled list"})
-            continue
-
-        item_id = info["itemId"]
-        try:
-            desc_html = await get_item_description(item_id)
-            cond_text = extract_condition_sentence_after_label(desc_html)
-            if not cond_text:
-                results.append({"sku": s, "itemId": item_id, "ok": False, "error": "No 'Condition:' label or sentence not found"})
-                continue
-
-            await revise_condition_description(item_id, cond_text)
-            ok = await verify_condition(item_id, cond_text)
-
-            results.append({
-                "sku": s,
-                "itemId": item_id,
-                "ok": bool(ok),
-                "applied": cond_text if ok else None,
-                "verify": "passed" if ok else "failed"
-            })
-        except HTTPException as e:
-            results.append({"sku": s, "itemId": item_id, "ok": False, "status": e.status_code, "error": e.detail})
-        except Exception as e:
-            results.append({"sku": s, "itemId": item_id, "ok": False, "itemId": item_id, "error": str(e)})
-
-    return {"updated": sum(1 for r in results if r.get("ok")), "total": len(results), "results": results}
-
-# ───────────── Debug (optional) ─────────────
 @app.get("/debug/token-file")
 def debug_token_file():
-    path = os.getenv("TOKEN_PATH", "/data/tokens.json")
+    path = "/data/tokens.json"
+    import os
     return {"path": path, "exists": os.path.exists(path), "size": (os.path.getsize(path) if os.path.exists(path) else None)}
+
+app.include_router(condition_router)
+app.include_router(bulk_router)
