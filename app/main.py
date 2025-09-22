@@ -1,10 +1,12 @@
-import logging, asyncio, os, json, io, re, csv
-from typing import List, Dict, Any, Tuple, Optional
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Body
+import logging, asyncio, os, io, re, csv, json, html
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any
+from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import RedirectResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from openpyxl import load_workbook
+import xml.etree.ElementTree as ET
 
 from .oauth import (
     build_auth_url,
@@ -16,11 +18,12 @@ from .oauth import (
 
 logger = logging.getLogger("uvicorn.error")
 
-app = FastAPI(title="Condition Updater Backend")
+# ────────────────────────────── App ──────────────────────────────
+app = FastAPI(title="Condition Updater (Scheduled, Trading API)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten later if you want
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,11 +34,10 @@ async def _start_refresher():
     async def loop():
         while True:
             try:
-                refreshed = await auto_refresh_if_needed()
-                if refreshed:
+                if await auto_refresh_if_needed():
                     logger.info("Access token auto-refreshed")
-            except Exception as e:
-                logger.exception("Auto-refresh failed: %s", e)
+            except Exception:
+                logger.exception("Auto-refresh failed")
             await asyncio.sleep(300)
     asyncio.create_task(loop())
 
@@ -47,17 +49,14 @@ def root():
 def healthz():
     return {"ok": True}
 
-# ---------- OAuth ----------
+# ─────────────────────── OAuth (unchanged) ───────────────────────
 @app.get("/oauth/login")
 def oauth_login():
-    url = build_auth_url()
-    logger.info("Redirecting to eBay auth: %s", url)
-    return RedirectResponse(url)
+    return RedirectResponse(build_auth_url())
 
 @app.get("/oauth/login/url")
 def oauth_login_url():
-    url = build_auth_url()
-    return {"url": url}
+    return {"url": build_auth_url()}
 
 @app.get("/oauth/callback")
 async def oauth_callback(request: Request):
@@ -88,256 +87,273 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
-# ---------- Parsing helpers ----------
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
-
-_SKU_KEYS = {"sku", "itemsku", "customlabel", "customlabels", "id"}
-_COND_KEYS = {"condition", "itemcondition", "cond", "conditionid"}
-_CONDDESC_KEYS = {"conditiondescription", "condition_desc", "conditiontext", "conddesc"}
-
-def _pick(mapper: Dict[str, str], cand: Dict[str, str], keys: set) -> str:
-    for k in keys:
-        if k in mapper:
-            v = cand.get(mapper[k], "")
-            if v:
-                return v
-    for k,v in cand.items():
-        if k in keys and v:
-            return v
-    return ""
-
-def _detect_header_row(rows: List[List[str]]) -> Tuple[int, Dict[str, str]]:
-    """
-    Find the header row index and a mapping from canonical keys to actual column keys.
-    Returns (header_index, mapping). mapping maps canonical 'sku','condition','conditiondescription'
-    to actual normalized column names found.
-    """
-    for i, r in enumerate(rows[:10]):  # scan first 10 rows
-        headers = [_norm(c) for c in r]
-        if not any(headers):
-            continue
-        hset = set(headers)
-        mapping: Dict[str, str] = {}
-        # find matches
-        def _find(one_of: set) -> Optional[str]:
-            for key in one_of:
-                if key in hset:
-                    return key
-            return None
-        sku_col = _find(_SKU_KEYS)
-        cond_col = _find(_COND_KEYS)
-        cdesc_col = _find(_CONDDESC_KEYS)
-        if sku_col:
-            if cond_col:  mapping["condition"] = cond_col
-            if cdesc_col: mapping["conditiondescription"] = cdesc_col
-            mapping["sku"] = sku_col
-            return i, mapping
-    # fallback: assume first row is header
-    headers = [_norm(c) for c in rows[0]] if rows else []
-    mapping = {}
-    for k in _SKU_KEYS:
-        if k in headers:
-            mapping["sku"] = k
-            break
-    for k in _COND_KEYS:
-        if k in headers:
-            mapping["condition"] = k
-            break
-    for k in _CONDDESC_KEYS:
-        if k in headers:
-            mapping["conditiondescription"] = k
-            break
-    return 0, mapping
-
-def _rows_from_xlsx(binary: bytes) -> Dict[str, Any]:
-    wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
-    sheetnames = wb.sheetnames
-    # collect first 20 rows from each sheet
-    raw_preview: Dict[str, List[List[str]]] = {}
-    parsed: List[Dict[str, Any]] = []
-    for name in sheetnames:
-        ws = wb[name]
-        rows = []
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            vals = [("" if v is None else str(v)) for v in row]
-            rows.append(vals)
-            if i >= 50:
-                break
-        raw_preview[name] = rows
-        if not rows:
-            continue
-        head_idx, mapping = _detect_header_row(rows)
-        data_rows = rows[head_idx+1:]
-        for vals in data_rows:
-            normrow = {_norm(k): (vals[j].strip() if j < len(vals) else "") for j,k in enumerate(rows[head_idx])}
-            sku = _pick(mapping, normrow, _SKU_KEYS)
-            cond = _pick(mapping, normrow, _COND_KEYS)
-            cdesc = _pick(mapping, normrow, _CONDDESC_KEYS)
-            if sku and str(sku).strip():
-                parsed.append({
-                    "sku": str(sku).strip(),
-                    "condition": str(cond or "").strip(),
-                    "conditionDescription": str(cdesc or "").strip()
-                })
-    return {"sheetnames": sheetnames, "raw_preview": raw_preview, "parsed": parsed}
-
-def _rows_from_csv(binary: bytes) -> Dict[str, Any]:
-    text = binary.decode("utf-8", errors="replace")
-    reader = csv.reader(io.StringIO(text))
-    rows = [[c for c in r] for r in reader]
-    preview = rows[:50]
-    if not rows:
-        return {"sheetnames": ["CSV"], "raw_preview": {"CSV": preview}, "parsed": []}
-    head_idx, mapping = _detect_header_row(rows)
-    parsed: List[Dict[str, Any]] = []
-    for vals in rows[head_idx+1:]:
-        normrow = {_norm(k): (vals[j].strip() if j < len(vals) else "") for j,k in enumerate(rows[head_idx])}
-        sku = _pick(mapping, normrow, _SKU_KEYS)
-        cond = _pick(mapping, normrow, _COND_KEYS)
-        cdesc = _pick(mapping, normrow, _CONDDESC_KEYS)
-        if sku and str(sku).strip():
-            parsed.append({
-                "sku": str(sku).strip(),
-                "condition": str(cond or "").strip(),
-                "conditionDescription": str(cdesc or "").strip()
-            })
-    return {"sheetnames": ["CSV"], "raw_preview": {"CSV": preview}, "parsed": parsed}
-
-def parse_file(binary: bytes, filename: str) -> Dict[str, Any]:
+# ─────────────────────── File → SKUs helper ──────────────────────
+def parse_file_to_skus(binary: bytes, filename: str) -> List[str]:
     name = (filename or "").lower()
+    if name.endswith(".xlsx"):
+        wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
+        skus: List[str] = []
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(values_only=True):
+                if not row:
+                    continue
+                v = row[0]
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if s:
+                    skus.append(s)
+        # de-dup preserve order
+        seen, out = set(), []
+        for s in skus:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
     if name.endswith(".csv"):
-        return _rows_from_csv(binary)
-    # default .xlsx
-    return _rows_from_xlsx(binary)
+        text = binary.decode("utf-8", errors="replace")
+        rdr = csv.reader(io.StringIO(text))
+        skus: List[str] = []
+        for i, row in enumerate(rdr):
+            if not row:
+                continue
+            s = str(row[0]).strip()
+            if not s:
+                continue
+            # allow header but we don't need it; if it's "sku" just skip first line
+            if i == 0 and s.lower() in {"sku", "customlabel"} and len(row) == 1:
+                continue
+            skus.append(s)
+        return skus
+    # .txt: one per line
+    text = binary.decode("utf-8", errors="replace")
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-# ---------- Inventory helpers ----------
-EBAY_INV_BASE = "https://api.ebay.com/sell/inventory/v1"
+# ───────────────────── Trading API client (OAuth) ─────────────────────
+TRADING_ENDPOINT = "https://api.ebay.com/ws/api.dll"
+SITE_ID = os.getenv("EBAY_SITE_ID", "0")             # 0 = US
+COMPAT_LEVEL = os.getenv("EBAY_COMPAT_LEVEL", "1231")
 
-def _auth_header() -> Dict[str, str]:
-    tok = TokenStore.get() or {}
-    access = tok.get("access_token")
-    if not access:
+def _oauth_token() -> str:
+    data = TokenStore.get() or {}
+    tok = data.get("access_token")
+    if not tok:
         raise HTTPException(status_code=400, detail="No access_token; run /oauth/login")
-    return {"Authorization": f"Bearer {access}", "Accept": "application/json", "Content-Type": "application/json"}
+    return tok
 
-async def _get_inventory_item(sku: str) -> Dict[str, Any]:
-    url = f"{EBAY_INV_BASE}/inventory_item/{sku}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=_auth_header())
-    if r.status_code == 404:
-        raise HTTPException(status_code=404, detail=f"SKU {sku} not found")
-    r.raise_for_status()
-    return r.json()
-
-async def _put_inventory_item(sku: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{EBAY_INV_BASE}/inventory_item/{sku}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.put(url, headers=_auth_header(), content=json.dumps(body))
-    try:
-        data = r.json()
-    except Exception:
-        data = {"text": r.text[:1000]}
-    if r.status_code >= 400:
-        raise HTTPException(status_code=r.status_code, detail=data)
-    return data
-
-# ---------- Inventory: test ----------
-@app.get("/inventory/ping")
-async def inventory_ping():
-    headers = _auth_header()
-    url = f"{EBAY_INV_BASE}/inventory_item"
-    params = {"limit": "1"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=headers, params=params)
-    try:
-        body = r.json()
-    except Exception:
-        body = r.text[:1000]
-    return {"status": r.status_code, "ok": r.status_code < 400, "data": body}
-
-# ---------- Inventory: single JSON ----------
-@app.post("/inventory/condition/update")
-async def inventory_condition_update(payload: Dict[str, Any] = Body(...)):
-    sku = str(payload.get("sku", "")).strip()
-    condition = str(payload.get("condition", "")).strip() or None
-    condition_desc = str(payload.get("conditionDescription", "")).strip() or None
-    if not sku:
-        raise HTTPException(status_code=400, detail="Missing sku")
-    current = await _get_inventory_item(sku)
-    body = current
-    if condition is not None:
-        body["condition"] = condition
-    if condition_desc is not None:
-        body["conditionDescription"] = condition_desc
-    updated = await _put_inventory_item(sku, body)
-    return {"status": "ok", "sku": sku, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": updated}
-
-# ---------- Inventory: preview & run ----------
-@app.post("/inventory/condition/preview")
-async def inventory_condition_preview(file: UploadFile = File(...)):
-    content = await file.read()
-    parsed = parse_file(content, file.filename)
-    # show a compact preview to help diagnose headers
-    sample = parsed["parsed"][:20]
-    meta = {
-        "sheetnames": parsed["sheetnames"],
-        "header_row_preview": {name: (parsed["raw_preview"][name][0] if parsed["raw_preview"][name] else []) for name in parsed["sheetnames"]}
+def _headers(call_name: str) -> Dict[str, str]:
+    return {
+        "X-EBAY-API-CALL-NAME": call_name,
+        "X-EBAY-API-SITEID": SITE_ID,
+        "X-EBAY-API-COMPATIBILITY-LEVEL": COMPAT_LEVEL,
+        "X-EBAY-API-IAF-TOKEN": _oauth_token(),  # OAuth user token
+        "Content-Type": "text/xml",
+        "Accept": "text/xml",
     }
-    return {"parsed_count": len(parsed["parsed"]), "sample": sample, "meta": meta}
 
-@app.get("/inventory/condition/update-batch/form", response_class=HTMLResponse)
-def inventory_condition_update_batch_form():
+def _wrap(call: str, inner_xml: str) -> str:
+    return f'<?xml version="1.0" encoding="utf-8"?><{call}Request xmlns="urn:ebay:apis:eBLBaseComponents">{inner_xml}</{call}Request>'
+
+async def trading_call(call_name: str, body_xml: str) -> ET.Element:
+    xml = _wrap(call_name, body_xml)
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(TRADING_ENDPOINT, headers=_headers(call_name), content=xml)
+    try:
+        root = ET.fromstring(r.text)
+    except Exception:
+        logger.error("Trading parse error (%s): %s", call_name, r.text[:1000])
+        raise HTTPException(status_code=502, detail=f"Trading parse error: {call_name}")
+    ack = (root.findtext(".//{urn:ebay:apis:eBLBaseComponents}Ack") or "").upper()
+    if ack not in {"SUCCESS", "WARNING"}:
+        short = root.findtext(".//{urn:ebay:apis:eBLBaseComponents}ShortMessage") or "Error"
+        long = root.findtext(".//{urn:ebay:apis:eBLBaseComponents}LongMessage") or ""
+        raise HTTPException(status_code=400, detail=f"{call_name}: {short} {long}".strip())
+    return root
+
+# ───────────── Scheduled lookup (GetSellerList, 121-day window) ─────────────
+def _ebay_time(dt: datetime) -> str:
+    # eBay expects GMT like 2025-09-21T03:10:00
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+async def get_scheduled_index() -> Dict[str, Dict[str, str]]:
+    """
+    Returns a map by lowercased SKU and CustomLabel → {itemId, title, sku, customLabel}
+    Only includes Scheduled listings within the next 121 days.
+    """
+    now = datetime.now(timezone.utc)
+    to  = now + timedelta(days=121)
+
+    # GetSellerList supports paging; we’ll pull first 200 (expand later if you need).
+    body = f"""
+        <RequesterCredentials/>
+        <StartTimeFrom>{_ebay_time(now)}</StartTimeFrom>
+        <StartTimeTo>{_ebay_time(to)}</StartTimeTo>
+        <GranularityLevel>Coarse</GranularityLevel>
+        <Pagination>
+            <EntriesPerPage>200</EntriesPerPage>
+            <PageNumber>1</PageNumber>
+        </Pagination>
+    """
+    root = await trading_call("GetSellerList", body)
+    ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
+    out: Dict[str, Dict[str, str]] = {}
+
+    for item in root.findall(".//e:ItemArray/e:Item", ns):
+        status = (item.findtext("e:ListingStatus", default="", namespaces=ns) or "").lower()
+        if status != "scheduled":
+            continue
+        item_id = item.findtext("e:ItemID", default="", namespaces=ns)
+        title   = item.findtext("e:Title", default="", namespaces=ns) or ""
+        sku     = item.findtext("e:SKU", default="", namespaces=ns) or ""
+        cl      = item.findtext("e:SellingManagerProductDetails/e:CustomLabel", default="", namespaces=ns) or ""
+        for key in (sku, cl):
+            if key and key.strip():
+                out[key.strip().lower()] = {
+                    "itemId": item_id,
+                    "title": title,
+                    "sku": sku,
+                    "customLabel": cl,
+                }
+    return out
+
+async def get_item_description(item_id: str) -> str:
+    body = f"""
+        <RequesterCredentials/>
+        <ItemID>{item_id}</ItemID>
+        <DetailLevel>ReturnAll</DetailLevel>
+    """
+    root = await trading_call("GetItem", body)
+    ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
+    return root.findtext(".//e:Item/e:Description", default="", namespaces=ns) or ""
+
+# ───────────── Extract first sentence after "Condition:" ─────────────
+TAG_RE = re.compile(r"<[^>]+>")                    # naive HTML strip
+COND_LABEL_RE = re.compile(r"condition\s*:\s*", re.IGNORECASE)
+
+def extract_condition_sentence_after_label(description_html: str, max_len: int = 600) -> str:
+    """Find 'Condition:' (case-insensitive), take the first sentence after it, ensure trailing period."""
+    if not description_html:
+        return ""
+    text = TAG_RE.sub("", description_html)          # strip tags
+    # Find label
+    m = COND_LABEL_RE.search(text)
+    if not m:
+        return ""                                    # no label → no update (matches local behavior)
+    after = text[m.end():].strip()
+    if not after:
+        return ""
+    # First sentence heuristic: up to first ., !, or ? (include delimiter)
+    m2 = re.search(r"[\.!\?]", after)
+    sent = after if not m2 else after[: m2.end()]
+    sent = sent.strip()
+    if not sent:
+        return ""
+    if sent[-1] not in ".!?":
+        sent += "."
+    if len(sent) > max_len:
+        sent = sent[: max_len - 1]
+        if sent[-1] != ".":
+            sent = sent.rstrip() + "."
+    return sent
+
+# ───────────── Revise condition description & verify ─────────────
+async def revise_condition_description(item_id: str, cond_desc: str) -> None:
+    body = f"""
+        <RequesterCredentials/>
+        <Item>
+            <ItemID>{item_id}</ItemID>
+            <ConditionDescription>{html.escape(cond_desc)}</ConditionDescription>
+        </Item>
+    """
+    await trading_call("ReviseItem", body)
+
+async def verify_condition(item_id: str, expected: str) -> bool:
+    html_desc = await get_item_description(item_id)  # includes conditionDescription? some calls do; safest approach:
+    # GetItem returns ConditionDescription separately in some schemas; fallback to parsing:
+    # Try direct node:
+    body = f"""
+        <RequesterCredentials/>
+        <ItemID>{item_id}</ItemID>
+        <DetailLevel>ReturnAll</DetailLevel>
+    """
+    root = await trading_call("GetItem", body)
+    ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
+    actual = root.findtext(".//e:Item/e:ConditionDescription", default="", namespaces=ns) or ""
+    return actual.strip() == expected.strip()
+
+# ───────────── UI Forms ─────────────
+@app.get("/trading/condition/update-batch/form", response_class=HTMLResponse)
+def form():
     return """
     <html><body>
-      <h3>Upload XLSX/CSV for Condition Update</h3>
-      <form action="/inventory/condition/preview" method="post" enctype="multipart/form-data" style="margin-bottom:12px;">
-        <input type="file" name="file" accept=".xlsx,.csv" required />
-        <button type="submit">Preview parsed rows</button>
+      <h3>Scheduled Listings — Condition Updater</h3>
+      <p>Upload SKUs only (.xlsx, .csv, or .txt). One SKU per row/line.</p>
+      <form action="/trading/condition/preview" method="post" enctype="multipart/form-data" style="margin-bottom:12px;">
+        <input type="file" name="file" accept=".xlsx,.csv,.txt" required />
+        <button type="submit">Preview (match SKUs to Scheduled)</button>
       </form>
-      <form action="/inventory/condition/update-batch" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".xlsx,.csv" required />
-        <button type="submit">Upload & Run</button>
+      <form action="/trading/condition/update-batch" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".xlsx,.csv,.txt" required />
+        <button type="submit">Run Update</button>
       </form>
-      <p>Header variants accepted: <code>sku | itemsku | customlabel</code>, <code>condition</code>, <code>conditionDescription | condition_description</code>.</p>
+      <p><i>Logic: find 'Condition:' in Description, take first sentence after it, ensure it ends with a period, then revise Condition Description.</i></p>
     </body></html>
     """
 
-@app.post("/inventory/condition/update-batch")
-async def inventory_condition_update_batch(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        parsed = parse_file(content, file.filename)
-        rows: List[Dict[str, Any]] = parsed["parsed"]
-        results: List[Dict[str, Any]] = []
-        for row in rows:
-            sku = str(row.get("sku", "")).strip()
-            if not sku:
-                results.append({"sku": None, "ok": False, "error": "missing sku"})
+# ───────────── Preview: which SKUs match Scheduled ─────────────
+@app.post("/trading/condition/preview")
+async def preview(file: UploadFile = File(...)):
+    content = await file.read()
+    skus = parse_file_to_skus(content, file.filename)
+    index = await get_scheduled_index()
+    items = []
+    for s in skus:
+        m = index.get(s.strip().lower())
+        items.append({"sku": s, "matched": bool(m), "itemId": (m or {}).get("itemId"), "title": (m or {}).get("title")})
+    return {"input_count": len(skus), "matched": sum(1 for x in items if x["matched"]), "items": items[:200]}
+
+# ───────────── Batch Update ─────────────
+@app.post("/trading/condition/update-batch")
+async def update_batch(file: UploadFile = File(...)):
+    content = await file.read()
+    skus = parse_file_to_skus(content, file.filename)
+    index = await get_scheduled_index()
+
+    results: List[Dict[str, Any]] = []
+    for s in skus:
+        key = s.strip().lower()
+        info = index.get(key)
+        if not info:
+            results.append({"sku": s, "ok": False, "error": "SKU not found in Scheduled list"})
+            continue
+
+        item_id = info["itemId"]
+        try:
+            desc_html = await get_item_description(item_id)
+            cond_text = extract_condition_sentence_after_label(desc_html)
+            if not cond_text:
+                results.append({"sku": s, "itemId": item_id, "ok": False, "error": "No 'Condition:' label or sentence not found"})
                 continue
-            try:
-                cur = await _get_inventory_item(sku)
-                body = cur
-                if "condition" in row and str(row["condition"]).strip():
-                    body["condition"] = str(row["condition"]).strip()
-                if "conditionDescription" in row and str(row["conditionDescription"]).strip():
-                    body["conditionDescription"] = str(row["conditionDescription"]).strip()
-                put = await _put_inventory_item(sku, body)
-                results.append({"sku": sku, "ok": True, "condition": body.get("condition"), "conditionDescription": body.get("conditionDescription"), "result": put})
-            except HTTPException as e:
-                results.append({"sku": sku, "ok": False, "status": e.status_code, "error": e.detail})
-            except Exception as e:
-                results.append({"sku": sku, "ok": False, "error": str(e)})
-        ok_count = sum(1 for r in results if r.get("ok"))
-        return {
-            "updated": ok_count,
-            "total": len(results),
-            "results": results,
-            "diagnostics": {
-                "parsed_count": len(rows),
-                "sheetnames": parsed["sheetnames"]
-            }
-        }
-    except Exception as e:
-        logger.exception("Batch update failed: %s", e)
-        raise HTTPException(status_code=500, detail=f"Batch update failed: {e}")
+
+            await revise_condition_description(item_id, cond_text)
+            ok = await verify_condition(item_id, cond_text)
+
+            results.append({
+                "sku": s,
+                "itemId": item_id,
+                "ok": bool(ok),
+                "applied": cond_text if ok else None,
+                "verify": "passed" if ok else "failed"
+            })
+        except HTTPException as e:
+            results.append({"sku": s, "itemId": item_id, "ok": False, "status": e.status_code, "error": e.detail})
+        except Exception as e:
+            results.append({"sku": s, "itemId": item_id, "ok": False, "error": str(e)})
+
+    return {"updated": sum(1 for r in results if r.get("ok")), "total": len(results), "results": results}
+
+# ───────────── Debug (optional) ─────────────
+@app.get("/debug/token-file")
+def debug_token_file():
+    path = os.getenv("TOKEN_PATH", "/data/tokens.json")
+    return {"path": path, "exists": os.path.exists(path), "size": (os.path.getsize(path) if os.path.exists(path) else None)}
