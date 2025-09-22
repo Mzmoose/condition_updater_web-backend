@@ -87,8 +87,24 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
+# ─────────────────────── Helpers: first 4 digits ───────────────────────
+FIRST4_RE = re.compile(r"^\s*(\d{4})")
+
+def first4(s: str) -> str:
+    """Return the first 4 leading digits from a string; empty if not found."""
+    if not s:
+        return ""
+    m = FIRST4_RE.match(s)
+    return m.group(1) if m else ""
+
 # ─────────────────────── File → SKUs helper ──────────────────────
 def parse_file_to_skus(binary: bytes, filename: str) -> List[str]:
+    """Accept .xlsx/.csv/.txt and return only the first 4 digits from each row/line."""
+    def push(acc: List[str], raw: str):
+        key = first4(raw)
+        if key:
+            acc.append(key)
+
     name = (filename or "").lower()
     if name.endswith(".xlsx"):
         wb = load_workbook(io.BytesIO(binary), read_only=True, data_only=True)
@@ -100,15 +116,15 @@ def parse_file_to_skus(binary: bytes, filename: str) -> List[str]:
                 v = row[0]
                 if v is None:
                     continue
-                s = str(v).strip()
-                if s:
-                    skus.append(s)
+                push(skus, str(v))
+        # de-dup preserve order
         seen, out = set(), []
         for s in skus:
             if s not in seen:
                 seen.add(s)
                 out.append(s)
         return out
+
     if name.endswith(".csv"):
         text = binary.decode("utf-8", errors="replace")
         rdr = csv.reader(io.StringIO(text))
@@ -116,15 +132,18 @@ def parse_file_to_skus(binary: bytes, filename: str) -> List[str]:
         for i, row in enumerate(rdr):
             if not row:
                 continue
-            s = str(row[0]).strip()
-            if not s:
+            raw = str(row[0])
+            if i == 0 and raw.strip().lower() in {"sku", "customlabel"} and len(row) == 1:
                 continue
-            if i == 0 and s.lower() in {"sku", "customlabel"} and len(row) == 1:
-                continue
-            skus.append(s)
+            push(skus, raw)
         return skus
+
+    # .txt: one per line
     text = binary.decode("utf-8", errors="replace")
-    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+    skus: List[str] = []
+    for ln in text.splitlines():
+        push(skus, ln)
+    return [s for s in skus if s]
 
 # ───────────────────── Trading API client (OAuth) ─────────────────────
 TRADING_ENDPOINT = "https://api.ebay.com/ws/api.dll"
@@ -245,14 +264,17 @@ async def _get_scheduled_via_getmyebayselling() -> List[Dict[str, str]]:
                 "customLabel": it.findtext("e:SellingManagerProductDetails/e:CustomLabel", default="", namespaces=ns) or "",
             })
 
-        total_pages = int(root.findtext(".//e:ScheduledList/e:PaginationResult/e:TotalNumberOfPages", default="1", namespaces=ns) or "1")
+        total_pages = int(
+            root.findtext(".//e:ScheduledList/e:PaginationResult/e:TotalNumberOfPages",
+                          default="1", namespaces=ns) or "1"
+        )
         page += 1
         if page > total_pages or page > 50:
             break
 
     return items
 
-# ───────────── Build index from both sources ─────────────
+# ───────────── Build index from both sources (with first4 keys) ─────────────
 async def get_scheduled_index() -> Dict[str, Dict[str, str]]:
     primary = await _get_scheduled_via_getsellerlist()
     fallback = await _get_scheduled_via_getmyebayselling()
@@ -261,14 +283,21 @@ async def get_scheduled_index() -> Dict[str, Dict[str, str]]:
     index: Dict[str, Dict[str, str]] = {}
     for it in all_items:
         for key in (it.get("sku",""), it.get("customLabel","")):
-            if key and key.strip():
-                k = key.strip().lower()
-                index[k] = {
-                    "itemId": it.get("itemId",""),
-                    "title": it.get("title",""),
-                    "sku": it.get("sku",""),
-                    "customLabel": it.get("customLabel",""),
-                }
+            if not key or not key.strip():
+                continue
+            full = key.strip().lower()
+            f4 = first4(key)
+            payload = {
+                "itemId": it.get("itemId",""),
+                "title": it.get("title",""),
+                "sku": it.get("sku",""),
+                "customLabel": it.get("customLabel",""),
+            }
+            # map full key
+            index[full] = payload
+            # map first 4 digits (only if present and not already mapped)
+            if f4 and f4 not in index:
+                index[f4] = payload
     return index
 
 # ───────────── Get/Revise Item ─────────────
@@ -332,7 +361,7 @@ def form():
     return """
     <html><body>
       <h3>Scheduled Listings — Condition Updater</h3>
-      <p>Upload SKUs only (.xlsx, .csv, or .txt). One SKU per row/line.</p>
+      <p>Upload SKUs only (.xlsx, .csv, or .txt). One SKU per row/line. Only the first 4 digits on each row are used.</p>
       <form action="/trading/condition/preview" method="post" enctype="multipart/form-data" style="margin-bottom:12px;">
         <input type="file" name="file" accept=".xlsx,.csv,.txt" required />
         <button type="submit">Preview (match SKUs to Scheduled)</button>
