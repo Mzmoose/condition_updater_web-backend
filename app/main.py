@@ -223,7 +223,6 @@ async def _get_scheduled_via_getmyebayselling() -> List[Dict[str, str]]:
             <DetailLevel>ReturnAll</DetailLevel>
             <ScheduledList>
                 <Include>true</Include>
-                <Sort>TimeLeft</Sort>
                 <Pagination>
                     <EntriesPerPage>200</EntriesPerPage>
                     <PageNumber>{page}</PageNumber>
