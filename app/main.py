@@ -170,7 +170,7 @@ async def trading_call(call_name: str, body_xml: str) -> ET.Element:
         raise HTTPException(status_code=400, detail=f"{call_name}: {short} {long}".strip())
     return root
 
-# ───────────── Scheduled lookup (GetSellerList, 121-day window) ─────────────
+# ───────────── Scheduled lookup (GetSellerList, 120-day window) ─────────────
 def _ebay_time(dt: datetime) -> str:
     # eBay expects GMT like 2025-09-21T03:10:00
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -178,12 +178,11 @@ def _ebay_time(dt: datetime) -> str:
 async def get_scheduled_index() -> Dict[str, Dict[str, str]]:
     """
     Returns a map by lowercased SKU and CustomLabel → {itemId, title, sku, customLabel}
-    Only includes Scheduled listings within the next 121 days.
+    Only includes Scheduled listings within the next 120 days.
     """
     now = datetime.now(timezone.utc)
-    to  = now + timedelta(days=121)
+    to  = now + timedelta(days=120)
 
-    # GetSellerList supports paging; we’ll pull first 200 (expand later if you need).
     body = f"""
         <RequesterCredentials/>
         <StartTimeFrom>{_ebay_time(now)}</StartTimeFrom>
@@ -238,7 +237,7 @@ def extract_condition_sentence_after_label(description_html: str, max_len: int =
     # Find label
     m = COND_LABEL_RE.search(text)
     if not m:
-        return ""                                    # no label → no update (matches local behavior)
+        return ""                                    # no label → no update
     after = text[m.end():].strip()
     if not after:
         return ""
@@ -268,9 +267,6 @@ async def revise_condition_description(item_id: str, cond_desc: str) -> None:
     await trading_call("ReviseItem", body)
 
 async def verify_condition(item_id: str, expected: str) -> bool:
-    html_desc = await get_item_description(item_id)  # includes conditionDescription? some calls do; safest approach:
-    # GetItem returns ConditionDescription separately in some schemas; fallback to parsing:
-    # Try direct node:
     body = f"""
         <RequesterCredentials/>
         <ItemID>{item_id}</ItemID>
