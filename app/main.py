@@ -190,8 +190,27 @@ async def trading_call(call_name: str, body_xml: str) -> ET.Element:
 def _ebay_time(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-TAG_RE = re.compile(r"<[^>]+>")
-COND_LABEL_RE = re.compile(r"condition\s*:\s*", re.IGNORECASE)
+# Convert HTML to text while preserving logical breaks so labels like "Brand:" don't glue on.
+def _html_to_text_preserve_breaks(desc_html: str) -> str:
+    if not desc_html:
+        return ""
+    t = desc_html
+    # turn common block/line tags into newlines before stripping
+    t = re.sub(r"(?is)<\s*br\s*/?\s*>", "\n", t)
+    t = re.sub(r"(?is)</\s*p\s*>", "\n", t)
+    t = re.sub(r"(?is)</\s*div\s*>", "\n", t)
+    t = re.sub(r"(?is)</\s*li\s*>", "\n", t)
+    t = re.sub(r"(?is)<\s*p[^>]*>", "\n", t)
+    t = re.sub(r"(?is)<\s*div[^>]*>", "\n", t)
+    t = re.sub(r"(?is)<\s*li[^>]*>", "\n- ", t)
+    # strip remaining tags
+    t = re.sub(r"(?is)<[^>]+>", "", t)
+    t = html.unescape(t)
+    # normalize whitespace/newlines
+    t = t.replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
 
 # ───────────── Scheduled lookup (GetSellerList w/ ReturnAll + pagination) ─────────────
 async def _get_scheduled_via_getsellerlist() -> List[Dict[str, str]]:
@@ -293,9 +312,7 @@ async def get_scheduled_index() -> Dict[str, Dict[str, str]]:
                 "sku": it.get("sku",""),
                 "customLabel": it.get("customLabel",""),
             }
-            # map full key
             index[full] = payload
-            # map first 4 digits (only if present and not already mapped)
             if f4 and f4 not in index:
                 index[f4] = payload
     return index
@@ -311,28 +328,54 @@ async def get_item_description(item_id: str) -> str:
     ns = {"e": "urn:ebay:apis:eBLBaseComponents"}
     return root.findtext(".//e:Item/e:Description", default="", namespaces=ns) or ""
 
+# --- NEW: robust extractor that stops at newline or next Word: label, else first sentence ---
+LABEL_AFTER_RE = re.compile(r"\b[A-Z][A-Za-z]+:", re.MULTILINE)
+COND_LABEL_RE = re.compile(r"(?i)condition\s*:\s*")
+
 def extract_condition_sentence_after_label(description_html: str, max_len: int = 600) -> str:
     if not description_html:
         return ""
-    text = TAG_RE.sub("", description_html)
+    text = _html_to_text_preserve_breaks(description_html)
+
     m = COND_LABEL_RE.search(text)
     if not m:
         return ""
-    after = text[m.end():].strip()
-    if not after:
-        return ""
-    m2 = re.search(r"[\.!\?]", after)
-    sent = after if not m2 else after[: m2.end()]
-    sent = sent.strip()
-    if not sent:
-        return ""
-    if sent[-1] not in ".!?":
-        sent += "."
-    if len(sent) > max_len:
-        sent = sent[: max_len - 1]
-        if sent[-1] != ".":
-            sent = sent.rstrip() + "."
-    return sent
+
+    after = text[m.end():].lstrip()
+
+    # 1) Prefer stopping at first newline (the "condition" line)
+    nl = after.find("\n")
+    candidates = []
+    if nl >= 0:
+        candidates.append(nl)
+
+    # 2) Or at the next "Word:" label like Brand:, Item:, Color:
+    lm = LABEL_AFTER_RE.search(after)
+    if lm:
+        candidates.append(lm.start())
+
+    # 3) Or at the end of the first sentence (., !, ?)
+    pm = re.search(r"[\.!\?]", after)
+    if pm:
+        candidates.append(pm.end())
+
+    end = min([c for c in candidates if c > 0], default=len(after))
+    snippet = after[:end].strip(" \t-•–—")
+
+    # normalize internal whitespace
+    snippet = re.sub(r"[ \t]{2,}", " ", snippet)
+
+    # ensure trailing period
+    if snippet and snippet[-1] not in ".!?":
+        snippet += "."
+
+    # length clamp
+    if len(snippet) > max_len:
+        snippet = snippet[: max_len].rstrip()
+        if snippet and snippet[-1] not in ".!?":
+            snippet += "."
+
+    return snippet
 
 async def revise_condition_description(item_id: str, cond_desc: str) -> None:
     body = f"""
@@ -370,7 +413,7 @@ def form():
         <input type="file" name="file" accept=".xlsx,.csv,.txt" required />
         <button type="submit">Run Update</button>
       </form>
-      <p><i>Logic: find 'Condition:' in Description, take first sentence after it, ensure it ends with a period, then revise Condition Description.</i></p>
+      <p><i>Logic: find 'Condition:' in Description, take only the first line (or next label), ensure it ends with a period.</i></p>
       <p>Debug: <a href="/trading/scheduled/sample">/trading/scheduled/sample</a></p>
     </body></html>
     """
