@@ -6,4 +6,6 @@ httpx
 cryptography
 openpyxl
 python-multipart
+python-multipart==0.0.9
+
 
