@@ -1,15 +1,13 @@
-# app/main.py  (DROP-IN REPLACE)
-
-import os
-import json
+# app/main.py
 import logging
 import asyncio
+import os
+import json
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# OAuth helpers
 from .oauth import (
     build_auth_url,
     exchange_code_for_tokens,
@@ -17,15 +15,14 @@ from .oauth import (
     auto_refresh_if_needed,
     TokenStore,
 )
-
-# 🔧 our app routes for the condition updater
 from .condition_update_endpoint import router as condition_router
+from .ub_monitor_endpoint import router as ub_monitor_router
 
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Condition Updater Backend")
 
-# CORS (open while you iterate; tighten later if you want)
+# CORS (open while you iterate; tighten later if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,7 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- background token auto-refresh every 5 minutes ---
+# Background auto-refresh of OAuth tokens
 @app.on_event("startup")
 async def _start_refresher():
     async def loop():
@@ -45,10 +42,9 @@ async def _start_refresher():
                     logger.info("Access token auto-refreshed")
             except Exception as e:
                 logger.exception("Auto-refresh failed: %s", e)
-            await asyncio.sleep(300)
+            await asyncio.sleep(300)  # 5 minutes
     asyncio.create_task(loop())
 
-# --- simple basics ---
 @app.get("/")
 def root():
     return RedirectResponse("/docs")
@@ -57,7 +53,7 @@ def root():
 def healthz():
     return {"ok": True}
 
-# --- OAuth flow ---
+# ---------- OAuth flow ----------
 @app.get("/oauth/login")
 def oauth_login():
     url = build_auth_url()
@@ -69,11 +65,7 @@ async def oauth_callback(request: Request):
     q = dict(request.query_params)
     if "error" in q:
         return JSONResponse(
-            {
-                "status": "error",
-                "error": q.get("error"),
-                "error_description": q.get("error_description"),
-            }
+            {"status": "error", "error": q.get("error"), "error_description": q.get("error_description")}
         )
     code = q.get("code")
     if not code:
@@ -99,16 +91,21 @@ async def oauth_refresh():
     tokens = await refresh_tokens()
     return {"status": "ok", "refreshed": True, "expires_in": tokens.get("expires_in")}
 
-# --- debug helper for the persisted token file ---
+# Debug helper to confirm the disk token file wiring
 @app.get("/debug/token-file")
 def debug_token_file():
     path = os.getenv("TOKEN_PATH", "/data/tokens.json")
     exists = os.path.exists(path)
     size = os.path.getsize(path) if exists else None
+    # If file exists but in-memory store is empty, load it
     if exists and not TokenStore.get():
         with open(path) as f:
             TokenStore.save(json.load(f))
     return {"path": path, "exists": exists, "size": size}
 
-# Mount feature router (has /trading/* endpoints)
+# ---------- Feature routers ----------
+# Trading / condition updater endpoints
 app.include_router(condition_router)
+
+# UB Monitor endpoints
+app.include_router(ub_monitor_router)
