@@ -1,42 +1,32 @@
-# app/services/trading.py
 from __future__ import annotations
-
 import re
 import httpx
 import xml.etree.ElementTree as ET
 from typing import Dict, Tuple, Optional
 from xml.sax.saxutils import escape
-
 from ..oauth import TokenStore
 
 EBAY_TRADING_ENDPOINT = "https://api.ebay.com/ws/api.dll"
-COMPAT_LEVEL = "1149"   # safe modern compatibility level
-SITE_ID = "0"           # 0 = US
-
+COMPAT_LEVEL = "1149"
+SITE_ID = "0"
 NS = {"e": "urn:ebay:apis:eBLBaseComponents"}
 FOUR = re.compile(r"^(\d{4})")
 
-
 def _sku_key(s: Optional[str]) -> str:
-    """Normalize SKU to first 4 digits when present."""
     s = (s or "").strip()
     m = FOUR.match(s)
     return m.group(1) if m else s
 
-
 def _post_trading(call_name: str, xml_body: str) -> ET.Element:
-    """Post an eBay Trading API call and return parsed XML root."""
     data = TokenStore.get() or {}
     token = data.get("access_token")
     if not token:
         raise RuntimeError("No OAuth token in TokenStore. Sign in at /oauth/login first.")
-
     headers = {
         "Content-Type": "text/xml",
         "X-EBAY-API-CALL-NAME": call_name,
         "X-EBAY-API-SITEID": SITE_ID,
         "X-EBAY-API-COMPATIBILITY-LEVEL": COMPAT_LEVEL,
-        # OAuth token for Trading API:
         "X-EBAY-API-IAF-TOKEN": token,
     }
     resp = httpx.post(EBAY_TRADING_ENDPOINT, headers=headers, content=xml_body, timeout=60.0)
@@ -48,16 +38,10 @@ def _post_trading(call_name: str, xml_body: str) -> ET.Element:
         raise RuntimeError(f"{call_name} failed: {err}")
     return root
 
-
 def get_scheduled_index() -> Dict[str, Tuple[str, str]]:
-    """
-    Return {normalized_sku: (itemId, title)} for SCHEDULED listings only.
-    Uses GetMyeBaySelling ScheduledList (no Sort param to avoid invalid value errors).
-    """
     page = 1
     per_page = 200
     out: Dict[str, Tuple[str, str]] = {}
-
     while True:
         body = f"""<?xml version="1.0" encoding="utf-8"?>
 <GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -72,10 +56,9 @@ def get_scheduled_index() -> Dict[str, Tuple[str, str]]:
   </ScheduledList>
 </GetMyeBaySellingRequest>"""
         root = _post_trading("GetMyeBaySelling", body)
-        items = root.findall(".//e:ScheduledList//e:Item", NS)
+        items = root.findall(".//e:ScheduledList//e:Item", namespaces=NS)
         if not items:
             break
-
         for it in items:
             item_id = it.findtext("./e:ItemID", namespaces=NS) or ""
             title = it.findtext("./e:Title", namespaces=NS) or ""
@@ -83,16 +66,16 @@ def get_scheduled_index() -> Dict[str, Tuple[str, str]]:
             key = _sku_key(sku)
             if key and item_id:
                 out[key] = (item_id, title)
-
         total_pages = int(
-            root.findtext(".//e:ScheduledList//e:PaginationResult//e:TotalNumberOfPages",namespaces=NS) or "1"
+            root.findtext(
+                ".//e:ScheduledList//e:PaginationResult//e:TotalNumberOfPages",
+                namespaces=NS,
+            ) or "1"
         )
         if page >= total_pages:
             break
         page += 1
-
     return out
-
 
 def get_item_description(item_id: str) -> str:
     body = f"""<?xml version="1.0" encoding="utf-8"?>
@@ -103,28 +86,23 @@ def get_item_description(item_id: str) -> str:
     root = _post_trading("GetItem", body)
     return root.findtext(".//e:Item//e:Description", namespaces=NS) or ""
 
-
 def extract_condition_sentence_after_label(description_html: str) -> Optional[str]:
-    """
-    Pull the first sentence after 'Condition:' from the description text.
-    Ensures a trailing period. Returns None if not found.
-    """
-    # crude strip of tags
-    text = re.sub(r"<[^>]+>", " ", description_html or "", flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-
-    m = re.search(r"condition\s*:\s*(.+)$", text, flags=re.IGNORECASE)
+    if not description_html:
+        return None
+    s = re.sub(r"(?is)</?(br|p|div|li|ul|ol|tr|td|table)[^>]*>", "\n", description_html or "")
+    s = re.sub(r"(?is)<[^>]+>", " ", s)
+    s = re.sub(r"[ \t\r\f\v]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n", s).strip()
+    m = re.search(r"(?im)^\s*condition\s*:\s*(.+)$", s)
     if not m:
         return None
-
-    tail = m.group(1).strip()
-    m2 = re.match(r"(.+?[\.!?])(\s|$)", tail)
-    sentence = (m2.group(1) if m2 else tail).strip()
-
-    if not sentence.endswith("."):
+    line = m.group(1).strip()
+    line = re.split(r"\s+[A-Z][A-Za-z/&\-\s]{0,24}:\s*", line)[0].strip()
+    m2 = re.match(r"(.+?[\.!?])(\s|$)", line)
+    sentence = (m2.group(1) if m2 else line).strip()
+    if not sentence.endswith((".", "!", "?")):
         sentence += "."
     return sentence
-
 
 def revise_condition_description(item_id: str, condition_text: str) -> None:
     body = f"""<?xml version="1.0" encoding="utf-8"?>
@@ -135,7 +113,6 @@ def revise_condition_description(item_id: str, condition_text: str) -> None:
   </Item>
 </ReviseItemRequest>"""
     _post_trading("ReviseItem", body)
-
 
 def verify_condition(item_id: str, expected: str) -> bool:
     body = f"""<?xml version="1.0" encoding="utf-8"?>
