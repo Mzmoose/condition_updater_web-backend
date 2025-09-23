@@ -85,7 +85,7 @@ def get_scheduled_index() -> Dict[str, Tuple[str, str]]:
                 out[key] = (item_id, title)
 
         total_pages = int(
-            root.findtext(".//e:ScheduledList//e:PaginationResult//e:TotalNumberOfPages", NS) or "1"
+            root.findtext(".//e:ScheduledList//e:PaginationResult//e:TotalNumberOfPages",namespaces=NS) or "1"
         )
         if page >= total_pages:
             break
