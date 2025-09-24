@@ -1,9 +1,10 @@
-
 from fastapi import FastAPI
 from app.routers.bulk_photos_endpoint import router as bulk_router
+from app.routers.auth_debug_endpoint import router as auth_debug_router
 
 app = FastAPI()
 app.include_router(bulk_router)
+app.include_router(auth_debug_router)
 
 @app.get("/")
 def root():
