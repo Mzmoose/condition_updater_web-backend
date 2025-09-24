@@ -15,8 +15,8 @@ def auth_debug():
             "EBAY_CLIENT_SECRET": bool(os.getenv("EBAY_CLIENT_SECRET")),
             "EBAY_REFRESH_TOKEN": bool(os.getenv("EBAY_REFRESH_TOKEN")),
             "EBAY_SCOPES": bool(os.getenv("EBAY_SCOPES")),
-            "TOKENS_FILE": os.getenv("TOKENS_FILE", ""),
             "EBAY_SCOPES_value": os.getenv("EBAY_SCOPES", ""),
+            "TOKENS_FILE": os.getenv("TOKENS_FILE", ""),
         },
         "ts": int(time.time()),
     }
