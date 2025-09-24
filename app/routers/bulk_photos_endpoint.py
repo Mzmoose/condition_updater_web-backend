@@ -1,7 +1,6 @@
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-
 from app.services.auth import auto_refresh_if_needed
 
 router = APIRouter(prefix="/bulk", tags=["bulk"])
@@ -15,7 +14,4 @@ def _identity_for_request():
 @router.get("/ui", response_class=HTMLResponse)
 async def bulk_ui(request: Request):
     tok, me = _identity_for_request()
-    if not tok:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return templates.TemplateResponse("bulk/ui.html", {"request": request, "me": me})
-
+    return templates.TemplateResponse("bulk/ui.html", {"request": request, "me": me, "authed": bool(tok)})
