@@ -1,6 +1,6 @@
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from . import __init__ as _pkg
 from app.services.bulk_downloader import run_bulk_download
@@ -59,7 +59,7 @@ def bulk_photos_run(req: BulkReq, request: Request):
             raise HTTPException(status_code=401, detail="signin_required")
         batch_zip = run_bulk_download(req.start_prefix, req.count, iaf)
         filename = f"bulk_photos_{req.start_prefix}_{req.count}.zip"
-        return StreamingResponse(iter([batch_zip]), media_type="application/zip",
+        return Response(content=batch_zip, media_type="application/zip",
                                  headers={"Content-Disposition": f'attachment; filename="{filename}"'})
     except HTTPException as he:
         raise he
