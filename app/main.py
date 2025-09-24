@@ -17,10 +17,12 @@ from .oauth import (
 )
 from .condition_update_endpoint import router as condition_router
 from .ub_monitor_endpoint import router as ub_monitor_router
+from .bulk_ui import router as bulk_ui_router
 
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Condition Updater Backend")
+app.include_router(bulk_ui_router)
 from .routers.bulk_photos_endpoint import router as bulk_router
 app.include_router(bulk_router)
 from .routers.pushover_test import router as pushover_test_router
