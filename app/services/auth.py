@@ -1,10 +1,19 @@
 import os, json, time, base64, urllib.request, urllib.parse, urllib.error
 
+def env_first(*keys, default=""):
+    for k in keys:
+        v = os.getenv(k, "")
+        if v:
+            return v, k
+    return default, None
+
 TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
-TOKENS_FILE = os.getenv("TOKENS_FILE", "app/data/tokens.json")
-CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "")
-DEFAULT_SCOPES = os.getenv("EBAY_SCOPES", "https://api.ebay.com/oauth/api_scope")
+
+TOKENS_FILE, TOKENS_FILE_KEY = env_first("TOKENS_FILE", "TOKEN_PATH", default="app/data/tokens.json")
+CLIENT_ID, CLIENT_ID_KEY = env_first("EBAY_CLIENT_ID", "EBAY_APP_ID", "APP_ID", default="")
+CLIENT_SECRET, CLIENT_SECRET_KEY = env_first("EBAY_CLIENT_SECRET", "EBAY_CERT_ID", "CERT_ID", default="")
+DEFAULT_SCOPES, SCOPES_KEY = env_first("EBAY_SCOPES", default="https://api.ebay.com/oauth/api_scope")
+REFRESH_TOKEN, REFRESH_TOKEN_KEY = env_first("EBAY_REFRESH_TOKEN", "EBAY_REFRESH_TOKEN_PROD", "REFRESH_TOKEN", default="")
 
 LAST_ERROR = ""
 
@@ -82,11 +91,10 @@ def _get_refresh_token():
     rt = tokens.get("refresh_token")
     if rt:
         return rt
-    env_rt = os.getenv("EBAY_REFRESH_TOKEN", "")
-    if env_rt:
-        tokens["refresh_token"] = env_rt
+    if REFRESH_TOKEN:
+        tokens["refresh_token"] = REFRESH_TOKEN
         _write_tokens(tokens)
-        return env_rt
+        return REFRESH_TOKEN
     return ""
 
 def auto_refresh_if_needed():
@@ -97,9 +105,12 @@ def auto_refresh_if_needed():
         if access and exp > _now() + 300:
             _set_error("")
             return access
+        if not CLIENT_ID or not CLIENT_SECRET:
+            _set_error("missing_client_creds")
+            return None
         rt = _get_refresh_token()
-        if not rt or not CLIENT_ID or not CLIENT_SECRET:
-            _set_error("missing_env_or_refresh_token")
+        if not rt:
+            _set_error("missing_refresh_token")
             return None
         return _refresh_access_token(rt)
     except Exception:
@@ -107,3 +118,21 @@ def auto_refresh_if_needed():
 
 def get_last_error():
     return LAST_ERROR
+
+def get_debug_info():
+    return {
+        "chosen_keys": {
+            "TOKENS_FILE": TOKENS_FILE_KEY or "default",
+            "EBAY_CLIENT_ID": CLIENT_ID_KEY,
+            "EBAY_CLIENT_SECRET": CLIENT_SECRET_KEY,
+            "EBAY_REFRESH_TOKEN": REFRESH_TOKEN_KEY,
+            "EBAY_SCOPES": SCOPES_KEY,
+        },
+        "present": {
+            "TOKENS_FILE": bool(TOKENS_FILE),
+            "EBAY_CLIENT_ID": bool(CLIENT_ID),
+            "EBAY_CLIENT_SECRET": bool(CLIENT_SECRET),
+            "EBAY_REFRESH_TOKEN": bool(REFRESH_TOKEN),
+            "EBAY_SCOPES": bool(DEFAULT_SCOPES),
+        }
+    }
