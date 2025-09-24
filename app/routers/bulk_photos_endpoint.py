@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from . import __init__ as _pkg
 from app.services.bulk_downloader import run_bulk_download
@@ -14,16 +14,20 @@ class BulkReq(BaseModel):
 @router.post("/photos/run")
 def bulk_photos_run(req: BulkReq, request: Request):
     try:
-        iaf = auto_refresh_if_needed(request)
+        try:
+            iaf = auto_refresh_if_needed(request)
+        except Exception:
+            iaf = None
         if not iaf:
             raise HTTPException(status_code=401, detail="signin_required")
         batch_zip = run_bulk_download(req.start_prefix, req.count, iaf)
-    except HTTPException:
-        raise
+        filename = f"bulk_photos_{req.start_prefix}_{req.count}.zip"
+        return StreamingResponse(iter([batch_zip]), media_type="application/zip",
+                                 headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    filename = f"bulk_photos_{req.start_prefix}_{req.count}.zip"
-    return StreamingResponse(iter([batch_zip]), media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+        return JSONResponse(status_code=500, content={"ok": False, "error": "bulk_error", "detail": str(e)})
 
 @router.get("/ui")
 def bulk_ui(request: Request):
@@ -60,7 +64,7 @@ btn.onclick = async () => {
       body: JSON.stringify({start_prefix: sp, count: ct})
     });
     if (r.status === 401) { msg.textContent = 'Please sign in with eBay first.'; return; }
-    if (!r.ok) { msg.textContent = 'Error: ' + (await r.text()); return; }
+    if (!r.ok) { const t = await r.text(); msg.textContent = 'Error: ' + t; return; }
     const blob = await r.blob();
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -73,3 +77,14 @@ btn.onclick = async () => {
 </body></html>
 """ % signin
     return HTMLResponse(content=html, status_code=200)
+
+@router.get("/session/check")
+def bulk_session_check(request: Request):
+    try:
+        try:
+            iaf = auto_refresh_if_needed(request)
+        except Exception:
+            iaf = None
+        return {"signed_in": bool(iaf)}
+    except Exception:
+        return {"signed_in": False}
