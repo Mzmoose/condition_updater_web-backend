@@ -1,9 +1,8 @@
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-from . import __init__ as _pkg
+from . import __init__ as _pkg  # keep package import stable
 from app.services.bulk_downloader import run_bulk_download
-from app.oauth import auto_refresh_if_needed, build_auth_url
 
 router = APIRouter(prefix="/bulk", tags=["bulk"])
 
@@ -11,13 +10,24 @@ class BulkReq(BaseModel):
     start_prefix: str = Field(min_length=1, max_length=10)
     count: int = Field(gt=0, le=500)
 
+def _get_signin_url(request: Request) -> str:
+    try:
+        from app.oauth import build_auth_url
+        return build_auth_url(request)
+    except Exception:
+        return "/oauth/login"
+
+def _session_token(request: Request):
+    try:
+        from app.oauth import auto_refresh_if_needed
+        return auto_refresh_if_needed(request)
+    except Exception:
+        return None
+
 @router.post("/photos/run")
 def bulk_photos_run(req: BulkReq, request: Request):
     try:
-        try:
-            iaf = auto_refresh_if_needed(request)
-        except Exception:
-            iaf = None
+        iaf = _session_token(request)
         if not iaf:
             raise HTTPException(status_code=401, detail="signin_required")
         batch_zip = run_bulk_download(req.start_prefix, req.count, iaf)
@@ -31,7 +41,7 @@ def bulk_photos_run(req: BulkReq, request: Request):
 
 @router.get("/ui")
 def bulk_ui(request: Request):
-    signin = build_auth_url(request)
+    signin = _get_signin_url(request)
     html = """
 <!doctype html><html><head><meta charset="utf-8"><title>Bulk Photos</title>
 <meta name="viewport" content="width=device-width, initial-scale=1"></head>
@@ -80,11 +90,5 @@ btn.onclick = async () => {
 
 @router.get("/session/check")
 def bulk_session_check(request: Request):
-    try:
-        try:
-            iaf = auto_refresh_if_needed(request)
-        except Exception:
-            iaf = None
-        return {"signed_in": bool(iaf)}
-    except Exception:
-        return {"signed_in": False}
+    iaf = _session_token(request)
+    return {"signed_in": bool(iaf)}
