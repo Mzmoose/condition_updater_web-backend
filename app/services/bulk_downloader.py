@@ -12,7 +12,7 @@ ITEM_REQ_TIMEOUT = 25
 PAGE_SLEEP = 0.1
 HARD_DEADLINE_SECS = 85
 
-def _token() -> str:
+def _env_token() -> str:
     tok = os.environ.get("EBAY_TRADING_TOKEN","").strip()
     if not tok:
         raise RuntimeError("EBAY_TRADING_TOKEN not set")
@@ -103,36 +103,27 @@ def _get_item_details(item_id: str, token: str):
     pics = [el.text for el in root.findall(".//e:Item/e:PictureDetails/e:PictureURL", namespaces=ns) if el.text]
     return {"Title": title, "SKU": sku, "PictureURLs": pics}
 
-def run_bulk_download(start_prefix: str, count: int) -> bytes:
-    token = _token()
+def run_bulk_download(start_prefix: str, count: int, iaf_token: str | None = None) -> bytes:
+    token = (iaf_token or "").strip() or _env_token()
     try:
         start = int(re.match(r"^\s*(\d{4})", start_prefix).group(1))
     except:
         raise RuntimeError("start_prefix must begin with 4 digits")
     deadline = datetime.utcnow() + timedelta(seconds=HARD_DEADLINE_SECS)
-
-    selected = []
-    seen = set()
-    target = count
-    current_prefix = start
-
+    selected, seen = [], set()
     for it in _iter_active_items(token):
         if datetime.utcnow() > deadline:
             break
         sku = it.get("SKU","")
         pf = _prefix4(sku)
-        if pf is None:
-            continue
-        if pf < current_prefix:
+        if pf is None or pf < start:
             continue
         if it["ItemID"] in seen:
             continue
-        if pf == current_prefix or pf >= current_prefix:
-            selected.append(it)
-            seen.add(it["ItemID"])
-            if len(selected) >= target:
-                break
-
+        selected.append(it)
+        seen.add(it["ItemID"])
+        if len(selected) >= count:
+            break
     batch_label = f"{datetime.utcnow().strftime('%Y%m%d_%H%M')}_{start}-{count}"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -144,8 +135,7 @@ def run_bulk_download(start_prefix: str, count: int) -> bytes:
             title = det["Title"] or it.get("Title","")
             sku = det["SKU"] or it.get("SKU","")
             folder = f"SKU_{_safe_name(sku)}" if sku else f"ITEM_{it['ItemID']}"
-            log_rows = []
-            num_saved = 0
+            log_rows, num_saved = [], 0
             for idx, url in enumerate(det.get("PictureURLs") or [], 1):
                 name = (f"SKU_{_safe_name(sku)}_{idx:03d}.jpg" if sku else f"ITEM_{it['ItemID']}_{idx:03d}.jpg")
                 path = f"_BATCH_{batch_label}/{folder}/{name}"
@@ -165,7 +155,6 @@ def run_bulk_download(start_prefix: str, count: int) -> bytes:
             for r in log_rows:
                 w.writerow(r)
             z.writestr(f"_BATCH_{batch_label}/{folder}/download_log.csv", log_csv.getvalue())
-
         import io as _io
         mf_csv = _io.StringIO()
         w = csv.DictWriter(mf_csv, fieldnames=["sku","item_id","title","images"])
