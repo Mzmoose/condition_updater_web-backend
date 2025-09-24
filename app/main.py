@@ -21,7 +21,7 @@ from .ub_monitor_endpoint import router as ub_monitor_router
 logger = logging.getLogger("uvicorn.error")
 
 app = FastAPI(title="Condition Updater Backend")
-from routers.pushover_test import router as pushover_test_router
+from .routers.pushover_test import router as pushover_test_router
 app.include_router(pushover_test_router)
 
 # CORS (open while you iterate; tighten later if needed)
