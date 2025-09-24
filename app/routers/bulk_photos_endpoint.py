@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 from . import __init__ as _pkg
 from app.services.bulk_downloader import run_bulk_download
+import os, json
 
 router = APIRouter(prefix="/bulk", tags=["bulk"])
 
@@ -29,10 +30,31 @@ def _session_token(request: Request):
     except Exception:
         return None
 
+def _token_from_file() -> str | None:
+    path = os.getenv("TOKEN_PATH", "").strip()
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        # Try common shapes
+        if isinstance(data, dict):
+            if "access_token" in data and isinstance(data["access_token"], str):
+                return data["access_token"]
+            # sometimes stored under 'token' or similar
+            for k in ("token", "iaf_token", "accessToken"):
+                if k in data and isinstance(data[k], str):
+                    return data[k]
+        return None
+    except Exception:
+        return None
+
 @router.post("/photos/run")
 def bulk_photos_run(req: BulkReq, request: Request):
     try:
         iaf = _session_token(request)
+        if not iaf:
+            iaf = _token_from_file()
         if not iaf:
             raise HTTPException(status_code=401, detail="signin_required")
         batch_zip = run_bulk_download(req.start_prefix, req.count, iaf)
@@ -97,4 +119,7 @@ btn.onclick = async () => {
 @router.get("/session/check")
 def bulk_session_check(request: Request):
     iaf = _session_token(request)
-    return {"signed_in": bool(iaf)}
+    if iaf:
+        return {"signed_in": True}
+    # fallback to global token file
+    return {"signed_in": bool(_token_from_file())}
