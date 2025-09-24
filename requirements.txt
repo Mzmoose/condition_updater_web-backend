@@ -8,3 +8,4 @@ openpyxl
 python-multipart==0.0.9
 beautifulsoup4
 lxml
+jinja2
