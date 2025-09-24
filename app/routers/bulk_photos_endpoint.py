@@ -1,7 +1,8 @@
+
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-from . import __init__ as _pkg  # keep package import stable
+from . import __init__ as _pkg
 from app.services.bulk_downloader import run_bulk_download
 
 router = APIRouter(prefix="/bulk", tags=["bulk"])
@@ -13,9 +14,13 @@ class BulkReq(BaseModel):
 def _get_signin_url(request: Request) -> str:
     try:
         from app.oauth import build_auth_url
-        return build_auth_url(request)
+        u = build_auth_url(request)
     except Exception:
-        return "/oauth/login"
+        u = "/oauth/login"
+    if "next=" not in u:
+        sep = "&" if "?" in u else "?"
+        u = f"{u}{sep}next=/bulk/ui"
+    return u
 
 def _session_token(request: Request):
     try:
@@ -71,6 +76,7 @@ btn.onclick = async () => {
     const r = await fetch('/bulk/photos/run', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
+      credentials: 'include',
       body: JSON.stringify({start_prefix: sp, count: ct})
     });
     if (r.status === 401) { msg.textContent = 'Please sign in with eBay first.'; return; }
