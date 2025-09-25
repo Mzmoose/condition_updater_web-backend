@@ -1,0 +1,22 @@
+name: smoke
+on:
+  push:
+    branches: [ bootstrap_clean ]
+  workflow_dispatch: {}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y curl jq
+      - name: verify
+        env:
+          BASE: https://condition-updater-web-backend-1.onrender.com
+        run: |
+          set -e
+          test "$(curl -sS -o /dev/null -w "%{http_code}\n" "$BASE/")" = "200"
+          test "$(curl -sS -o /dev/null -w "%{http_code}\n" "$BASE/health")" = "200"
+          test "$(curl -sS -o /dev/null -w "%{http_code}\n" "$BASE/bulk/ui")" = "200"
+          curl -sS "$BASE/openapi.json" | jq -r '.paths | keys[]' | grep -Eq '^/bulk|^/monitor'
+          curl -sS "$BASE/monitor/ub/check" | jq -e '.ok==true' >/dev/null
